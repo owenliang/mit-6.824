@@ -182,7 +182,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	DPrintf("RaftNode[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]",
 		rf.me, args.CandidateId, args.Term, rf.currentTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
-	defer DPrintf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] ", rf.me, args.CandidateId, reply.VoteGranted)
+	defer func() {
+		DPrintf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] ", rf.me, args.CandidateId, reply.VoteGranted)
+	}()
 
 	// 任期不如我大，拒绝投票
 	if args.Term < rf.currentTerm {
@@ -211,6 +213,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 		reply.VoteGranted = true
+		rf.lastActiveTime = time.Now() // 为其他人投票，那么重置自己的下次投票时间
 	}
 }
 
@@ -365,7 +368,8 @@ func (rf *Raft) electionLoop() {
 						if voteResult.resp != nil {
 							if voteResult.resp.VoteGranted {
 								voteCount += 1
-							} else if voteResult.resp.Term > maxTerm {
+							}
+							if voteResult.resp.Term > maxTerm {
 								maxTerm = voteResult.resp.Term
 							}
 						}
@@ -377,8 +381,10 @@ func (rf *Raft) electionLoop() {
 				}
 				VOTE_END:
 				rf.mu.Lock()
-				DPrintf("RaftNode[%d] RequestVote ends, finishCount[%d] voteCount[%d] Role[%s] maxTerm[%d] currentTerm[%d]", rf.me, finishCount, voteCount,
-					rf.role, maxTerm, rf.currentTerm)
+				defer func() {
+					DPrintf("RaftNode[%d] RequestVote ends, finishCount[%d] voteCount[%d] Role[%s] maxTerm[%d] currentTerm[%d]", rf.me, finishCount, voteCount,
+						rf.role, maxTerm, rf.currentTerm)
+				}()
 				// 如果角色改变了，则忽略本轮投票结果
 				if rf.role != ROLE_CANDIDATES {
 					return
