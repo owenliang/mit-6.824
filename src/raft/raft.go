@@ -17,7 +17,11 @@ package raft
 //   in the same server.
 //
 
-import "sync"
+import (
+	"math/rand"
+	"sync"
+	"time"
+)
 import "sync/atomic"
 import "../labrpc"
 
@@ -43,6 +47,17 @@ type ApplyMsg struct {
 	CommandIndex int
 }
 
+// 日志项
+type LogEntry struct {
+	Command interface{}
+	Term int
+}
+
+// 当前角色
+const ROLE_LEADER = "Leader"
+const ROLE_FOLLOWER = "Follower"
+const ROLE_CANDIDATES = "Candidates"
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -57,6 +72,23 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// 所有服务器，持久化状态
+	currentTerm int // 见过的最大任期
+	votedFor int // 记录在currentTerm任期投票给谁了
+	log []LogEntry	// 操作日志
+
+	// 所有服务器，易失状态
+	commitIndex int		// 已知的最大已提交索引
+	lastApplied int		// 当前应用到状态机的索引
+
+	// 仅Leader，易失状态（成为leader时重置）
+	nextIndex []int //	每个follower的log同步起点索引（初始为leader log的最后一项）
+	matchIndex []int 	// 每个follower的log同步进度（初始为0），和nextIndex强关联
+
+	// 所有服务器，选举相关状态
+	role string	// 身份
+	leaderId int 	// leader的id
+	lastActiveTime time.Time	// 上次活跃时间（刷新时机：收到leader心跳、给其他candidates投票、请求其他节点投票）
 }
 
 // return currentTerm and whether this server
@@ -117,6 +149,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term int
+	CandidateId int
+	LastLogIndex int
+	LastLogTerm int
 }
 
 //
@@ -125,6 +161,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term int
+	VoteGranted bool
 }
 
 //
@@ -132,6 +170,7 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+
 }
 
 //
@@ -215,6 +254,112 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) electionLoop() {
+	for !rf.killed() {
+		time.Sleep(1 * time.Millisecond)
+
+		func() {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			now := time.Now()
+			timeout := time.Duration(200 + rand.Int31n(150)) * time.Second	// 超时随机化
+			elapses := now.Sub(rf.lastActiveTime)
+			// follower -> candidates
+			if rf.role == ROLE_FOLLOWER {
+				if elapses >= timeout {
+					rf.role = ROLE_CANDIDATES
+				}
+				DPrintf("RaftNode[%d] Follower -> Candidate", rf.me)
+			}
+			// 请求vote
+			if rf.role == ROLE_CANDIDATES && elapses >= timeout {
+				rf.lastActiveTime = now // 重置下次选举时间
+
+				rf.currentTerm += 1	// 发起新任期
+
+				// 请求投票req
+				args := RequestVoteArgs{
+					Term: rf.currentTerm,
+					CandidateId: rf.me,
+					LastLogIndex: len(rf.log),
+				}
+				if len(rf.log) != 0 {
+					args.LastLogTerm = rf.log[len(rf.log) - 1].Term
+				}
+
+				rf.mu.Unlock()
+
+				DPrintf("RaftNode[%d] RequestVote starts, Term[%d] LastLogIndex[%d] LastLogTerm[%d]", rf.me, args.Term,
+					args.LastLogIndex, args.LastLogTerm)
+
+				// 并发RPC请求vote
+				type VoteResult struct {
+					peerId int
+					resp *RequestVoteReply
+				}
+				voteCount := 1	// 收到投票个数（先给自己投1票）
+				finishCount := 1	// 收到应答个数
+				voteResultChan := make(chan *VoteResult, len(rf.peers))
+				for peerId := 0; peerId < len(rf.peers); peerId++ {
+					go func(id int) {
+						if id == rf.me {
+							return
+						}
+						resp := RequestVoteReply{}
+						if ok := rf.sendRequestVote(id, &args, &resp); ok {
+							voteResultChan <- &VoteResult{peerId: id, resp: &resp}
+						} else {
+							voteResultChan <- &VoteResult{peerId: id, resp: nil}
+						}
+					}(peerId)
+				}
+
+				maxTerm := 0
+				for {
+					select {
+					case voteResult := <- voteResultChan:
+						finishCount += 1
+						if voteResult.resp != nil {
+							if voteResult.resp.VoteGranted {
+								voteCount += 1
+							}
+							if voteResult.resp.Term > maxTerm {
+								maxTerm = voteResult.resp.Term
+							}
+						}
+						// 得到大多数vote后，立即离开
+						if finishCount == len(rf.peers) || voteCount > len(rf.peers) / 2 {
+							goto VOTE_END
+						}
+					}
+				}
+				VOTE_END:
+				rf.mu.Lock()
+				DPrintf("RaftNode[%d] RequestVote ends, finishCount[%d] voteCount[%d] Role[%s] maxTerm[%d] currentTerm[%d]", rf.me, finishCount, voteCount,
+					rf.role, maxTerm, rf.currentTerm)
+				// 如果角色改变了，则忽略本轮投票结果
+				if rf.role != ROLE_CANDIDATES {
+					return
+				}
+				// 发现了更高的任期，切回follower
+				if maxTerm > rf.currentTerm {
+					rf.role = ROLE_FOLLOWER
+					rf.leaderId = -1
+					rf.currentTerm = maxTerm
+					return
+				}
+				// 赢得大多数选票，则成为leader
+				if voteCount > len(rf.peers) / 2 {
+					rf.role = ROLE_LEADER
+					rf.leaderId = rf.me
+					return
+				}
+			}
+		}()
+	}
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -234,10 +379,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.role = ROLE_FOLLOWER
+	rf.leaderId = -1
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go rf.electionLoop()
+
+	DPrintf("Raftnode[%d]启动", me)
 
 	return rf
 }
