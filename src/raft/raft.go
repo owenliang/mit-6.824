@@ -94,10 +94,14 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	term = rf.currentTerm
+	isleader = rf.role == ROLE_LEADER
 	return term, isleader
 }
 
@@ -170,7 +174,44 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	reply.Term = rf.currentTerm
+	reply.VoteGranted = false
+
+	DPrintf("RaftNode[%d] Handle RequestVote, CandidatesId[%d] Term[%d] CurrentTerm[%d] LastLogIndex[%d] LastLogTerm[%d] votedFor[%d]",
+		rf.me, args.CandidateId, args.Term, rf.currentTerm, args.LastLogIndex, args.LastLogTerm, rf.votedFor)
+	defer DPrintf("RaftNode[%d] Return RequestVote, CandidatesId[%d] VoteGranted[%v] ", rf.me, args.CandidateId, reply.VoteGranted)
+
+	// 任期不如我大，拒绝投票
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 发现更大的任期，则转为该任期的follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = ROLE_FOLLOWER
+		rf.votedFor = -1
+		rf.leaderId = -1
+		// 继续向下走，进行投票
+	}
+
+	// 每个任期，只能投票给1人
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
+		// candidate的日志必须比我的新
+		// 1, 最后一条log，任期大的更新
+		// 2，更长的log则更新
+		lastLogTerm := 0
+		if len(rf.log) != 0 {
+			lastLogTerm = rf.log[len(rf.log) - 1].Term
+		}
+		if args.LastLogTerm < lastLogTerm ||  args.LastLogIndex < len(rf.log)  {
+			return
+		}
+		reply.VoteGranted = true
+	}
 }
 
 //
@@ -263,20 +304,21 @@ func (rf *Raft) electionLoop() {
 			defer rf.mu.Unlock()
 
 			now := time.Now()
-			timeout := time.Duration(200 + rand.Int31n(150)) * time.Second	// 超时随机化
+			timeout := time.Duration(200 + rand.Int31n(150)) * time.Millisecond	// 超时随机化
 			elapses := now.Sub(rf.lastActiveTime)
 			// follower -> candidates
 			if rf.role == ROLE_FOLLOWER {
 				if elapses >= timeout {
 					rf.role = ROLE_CANDIDATES
+					DPrintf("RaftNode[%d] Follower -> Candidate", rf.me)
 				}
-				DPrintf("RaftNode[%d] Follower -> Candidate", rf.me)
 			}
 			// 请求vote
 			if rf.role == ROLE_CANDIDATES && elapses >= timeout {
 				rf.lastActiveTime = now // 重置下次选举时间
 
 				rf.currentTerm += 1	// 发起新任期
+				rf.votedFor = rf.me	// 该任期投了自己
 
 				// 请求投票req
 				args := RequestVoteArgs{
@@ -323,8 +365,7 @@ func (rf *Raft) electionLoop() {
 						if voteResult.resp != nil {
 							if voteResult.resp.VoteGranted {
 								voteCount += 1
-							}
-							if voteResult.resp.Term > maxTerm {
+							} else if voteResult.resp.Term > maxTerm {
 								maxTerm = voteResult.resp.Term
 							}
 						}
@@ -347,6 +388,7 @@ func (rf *Raft) electionLoop() {
 					rf.role = ROLE_FOLLOWER
 					rf.leaderId = -1
 					rf.currentTerm = maxTerm
+					rf.votedFor = - 1
 					return
 				}
 				// 赢得大多数选票，则成为leader
@@ -381,6 +423,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.role = ROLE_FOLLOWER
 	rf.leaderId = -1
+	rf.votedFor = -1
+	rf.lastActiveTime = time.Now()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
