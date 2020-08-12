@@ -20,15 +20,14 @@ package raft
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"../labrpc"
 )
-import "sync/atomic"
-import "../labrpc"
 
 // import "bytes"
 // import "../labgob"
-
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,7 +49,7 @@ type ApplyMsg struct {
 // 日志项
 type LogEntry struct {
 	Command interface{}
-	Term int
+	Term    int
 }
 
 // 当前角色
@@ -73,23 +72,23 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// 所有服务器，持久化状态（lab-2A不要求持久化）
-	currentTerm int // 见过的最大任期
-	votedFor int // 记录在currentTerm任期投票给谁了
-	log []*LogEntry	// 操作日志
+	currentTerm int         // 见过的最大任期
+	votedFor    int         // 记录在currentTerm任期投票给谁了
+	log         []*LogEntry // 操作日志
 
 	// 所有服务器，易失状态
-	commitIndex int		// 已知的最大已提交索引
-	lastApplied int		// 当前应用到状态机的索引
+	commitIndex int // 已知的最大已提交索引
+	lastApplied int // 当前应用到状态机的索引
 
 	// 仅Leader，易失状态（成为leader时重置）
-	nextIndex []int //	每个follower的log同步起点索引（初始为leader log的最后一项）
-	matchIndex []int 	// 每个follower的log同步进度（初始为0），和nextIndex强关联
+	nextIndex  []int //	每个follower的log同步起点索引（初始为leader log的最后一项）
+	matchIndex []int // 每个follower的log同步进度（初始为0），和nextIndex强关联
 
 	// 所有服务器，选举相关状态
-	role string	// 身份
-	leaderId int 	// leader的id
-	lastActiveTime time.Time	// 上次活跃时间（刷新时机：收到leader心跳、给其他candidates投票、请求其他节点投票）
-	lastBroadcastTime time.Time	// 作为leader，上次的广播时间
+	role              string    // 身份
+	leaderId          int       // leader的id
+	lastActiveTime    time.Time // 上次活跃时间（刷新时机：收到leader心跳、给其他candidates投票、请求其他节点投票）
+	lastBroadcastTime time.Time // 作为leader，上次的广播时间
 }
 
 // return currentTerm and whether this server
@@ -122,7 +121,6 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -145,19 +143,16 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
-
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term int
-	CandidateId int
+	Term         int
+	CandidateId  int
 	LastLogIndex int
-	LastLogTerm int
+	LastLogTerm  int
 }
 
 //
@@ -166,21 +161,21 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term int
+	Term        int
 	VoteGranted bool
 }
 
 type AppendEntriesArgs struct {
-	Term int
-	LeaderId int
+	Term         int
+	LeaderId     int
 	PrevLogIndex int
-	PrevLogTerm int
-	Entries []*LogEntry
+	PrevLogTerm  int
+	Entries      []*LogEntry
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term int
+	Term    int
 	Success bool
 }
 
@@ -222,15 +217,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// 2，更长的log则更新
 		lastLogTerm := 0
 		if len(rf.log) != 0 {
-			lastLogTerm = rf.log[len(rf.log) - 1].Term
+			lastLogTerm = rf.log[len(rf.log)-1].Term
 		}
-		if args.LastLogTerm < lastLogTerm ||  args.LastLogIndex < len(rf.log)  {
+		if args.LastLogTerm < lastLogTerm || args.LastLogIndex < len(rf.log) {
 			return
 		}
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.lastActiveTime = time.Now() // 为其他人投票，那么重置自己的下次投票时间
 	}
+	rf.persist()
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -266,6 +262,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.lastActiveTime = time.Now()
 
 	// 日志操作lab-2A不实现
+	rf.persist()
 }
 
 //
@@ -307,7 +304,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -328,7 +324,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -363,7 +358,7 @@ func (rf *Raft) electionLoop() {
 			defer rf.mu.Unlock()
 
 			now := time.Now()
-			timeout := time.Duration(200 + rand.Int31n(150)) * time.Millisecond	// 超时随机化
+			timeout := time.Duration(200+rand.Int31n(150)) * time.Millisecond // 超时随机化
 			elapses := now.Sub(rf.lastActiveTime)
 			// follower -> candidates
 			if rf.role == ROLE_FOLLOWER {
@@ -376,17 +371,18 @@ func (rf *Raft) electionLoop() {
 			if rf.role == ROLE_CANDIDATES && elapses >= timeout {
 				rf.lastActiveTime = now // 重置下次选举时间
 
-				rf.currentTerm += 1	// 发起新任期
-				rf.votedFor = rf.me	// 该任期投了自己
+				rf.currentTerm += 1 // 发起新任期
+				rf.votedFor = rf.me // 该任期投了自己
+				rf.persist()
 
 				// 请求投票req
 				args := RequestVoteArgs{
-					Term: rf.currentTerm,
-					CandidateId: rf.me,
+					Term:         rf.currentTerm,
+					CandidateId:  rf.me,
 					LastLogIndex: len(rf.log),
 				}
 				if len(rf.log) != 0 {
-					args.LastLogTerm = rf.log[len(rf.log) - 1].Term
+					args.LastLogTerm = rf.log[len(rf.log)-1].Term
 				}
 
 				rf.mu.Unlock()
@@ -397,10 +393,10 @@ func (rf *Raft) electionLoop() {
 				// 并发RPC请求vote
 				type VoteResult struct {
 					peerId int
-					resp *RequestVoteReply
+					resp   *RequestVoteReply
 				}
-				voteCount := 1	// 收到投票个数（先给自己投1票）
-				finishCount := 1	// 收到应答个数
+				voteCount := 1   // 收到投票个数（先给自己投1票）
+				finishCount := 1 // 收到应答个数
 				voteResultChan := make(chan *VoteResult, len(rf.peers))
 				for peerId := 0; peerId < len(rf.peers); peerId++ {
 					go func(id int) {
@@ -419,7 +415,7 @@ func (rf *Raft) electionLoop() {
 				maxTerm := 0
 				for {
 					select {
-					case voteResult := <- voteResultChan:
+					case voteResult := <-voteResultChan:
 						finishCount += 1
 						if voteResult.resp != nil {
 							if voteResult.resp.VoteGranted {
@@ -430,12 +426,12 @@ func (rf *Raft) electionLoop() {
 							}
 						}
 						// 得到大多数vote后，立即离开
-						if finishCount == len(rf.peers) || voteCount > len(rf.peers) / 2 {
+						if finishCount == len(rf.peers) || voteCount > len(rf.peers)/2 {
 							goto VOTE_END
 						}
 					}
 				}
-				VOTE_END:
+			VOTE_END:
 				rf.mu.Lock()
 				defer func() {
 					DPrintf("RaftNode[%d] RequestVote ends, finishCount[%d] voteCount[%d] Role[%s] maxTerm[%d] currentTerm[%d]", rf.me, finishCount, voteCount,
@@ -450,14 +446,15 @@ func (rf *Raft) electionLoop() {
 					rf.role = ROLE_FOLLOWER
 					rf.leaderId = -1
 					rf.currentTerm = maxTerm
-					rf.votedFor = - 1
+					rf.votedFor = -1
+					rf.persist()
 					return
 				}
 				// 赢得大多数选票，则成为leader
-				if voteCount > len(rf.peers) / 2 {
+				if voteCount > len(rf.peers)/2 {
 					rf.role = ROLE_LEADER
 					rf.leaderId = rf.me
-					rf.lastBroadcastTime = time.Unix(0, 0)	// 令appendEntries广播立即执行
+					rf.lastBroadcastTime = time.Unix(0, 0) // 令appendEntries广播立即执行
 					return
 				}
 			}
@@ -481,7 +478,7 @@ func (rf *Raft) appendEntriesLoop() {
 
 			// 100ms广播1次
 			now := time.Now()
-			if now.Sub(rf.lastBroadcastTime) < 100 * time.Millisecond {
+			if now.Sub(rf.lastBroadcastTime) < 100*time.Millisecond {
 				return
 			}
 			rf.lastBroadcastTime = time.Now()
@@ -489,7 +486,7 @@ func (rf *Raft) appendEntriesLoop() {
 			// 并发RPC心跳
 			type AppendResult struct {
 				peerId int
-				resp *AppendEntriesReply
+				resp   *AppendEntriesReply
 			}
 
 			for peerId := 0; peerId < len(rf.peers); peerId++ {
@@ -507,11 +504,12 @@ func (rf *Raft) appendEntriesLoop() {
 					if ok := rf.sendAppendEntries(id, args1, &reply); ok {
 						rf.mu.Lock()
 						defer rf.mu.Unlock()
-						if reply.Term > rf.currentTerm {	// 变成follower
+						if reply.Term > rf.currentTerm { // 变成follower
 							rf.role = ROLE_FOLLOWER
 							rf.leaderId = -1
 							rf.currentTerm = reply.Term
-							rf.votedFor = - 1
+							rf.votedFor = -1
+							rf.persist()
 						}
 						DPrintf("RaftNode[%d] appendEntries ends, peerTerm[%d] myCurrentTerm[%d] myRole[%s]", rf.me, reply.Term, rf.currentTerm, rf.role)
 					}
