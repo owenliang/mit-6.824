@@ -18,8 +18,8 @@ package raft
 //
 
 import (
-	"math"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -264,11 +264,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 刷新活跃时间
 	rf.lastActiveTime = time.Now()
 
+	defer func() {
+		// 更新提交下标
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = args.LeaderCommit
+			if len(rf.log) < rf.commitIndex {
+				rf.commitIndex = len(rf.log)
+			}
+		}
+	}()
+
 	// 没同步日志，那就是单纯的心跳
 	if len(args.Entries) != 0 {
 		// appendEntries RPC , receiver 2)
-		if len(rf.log) >= args.PrevLogIndex && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			return
+		// todo:
+		if args.PrevLogIndex > 0 {
+			// 如果本地没有前一个日志的话，那么false
+			if len(rf.log) < args.PrevLogIndex {
+				return
+			}
+			// 如果本地有前一个日志的话，那么term必须相同，否则false
+			if rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
+				return
+			}
 		}
 
 		// 截断本地日志
@@ -284,14 +302,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		rf.persist()
-	}
-
-	// 更新提交下标
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = args.LeaderCommit
-		if len(rf.log) < rf.commitIndex {
-			rf.commitIndex = len(rf.log)
-		}
 	}
 	reply.Success = true
 }
@@ -411,7 +421,7 @@ func (rf *Raft) electionLoop() {
 			if rf.role == ROLE_FOLLOWER {
 				if elapses >= timeout {
 					rf.role = ROLE_CANDIDATES
-					// DPrintf("RaftNode[%d] Follower -> Candidate", rf.me)
+					DPrintf("RaftNode[%d] Follower -> Candidate", rf.me)
 				}
 			}
 			// 请求vote
@@ -434,10 +444,8 @@ func (rf *Raft) electionLoop() {
 
 				rf.mu.Unlock()
 
-				/*
 				DPrintf("RaftNode[%d] RequestVote starts, Term[%d] LastLogIndex[%d] LastLogTerm[%d]", rf.me, args.Term,
 					args.LastLogIndex, args.LastLogTerm)
-				*/
 				// 并发RPC请求vote
 				type VoteResult struct {
 					peerId int
@@ -482,10 +490,8 @@ func (rf *Raft) electionLoop() {
 			VOTE_END:
 				rf.mu.Lock()
 				defer func() {
-					/*
 					DPrintf("RaftNode[%d] RequestVote ends, finishCount[%d] voteCount[%d] Role[%s] maxTerm[%d] currentTerm[%d]", rf.me, finishCount, voteCount,
 						rf.role, maxTerm, rf.currentTerm)
-					 */
 				}()
 				// 如果角色改变了，则忽略本轮投票结果
 				if rf.role != ROLE_CANDIDATES {
@@ -557,12 +563,12 @@ func (rf *Raft) appendEntriesLoop() {
 				args.LeaderId = rf.me
 				args.LeaderCommit = rf.commitIndex
 				if len(rf.log) != 0 {
-					args.PrevLogIndex = len(rf.log)
-					args.PrevLogTerm = rf.log[len(rf.log) - 1].Term
-					if len(rf.log) >= rf.nextIndex[peerId] {
-						args.Entries = make([]*LogEntry, 0)
-						args.Entries = append(args.Entries, rf.log[rf.nextIndex[peerId]-1:]...)
+					args.PrevLogIndex = rf.nextIndex[peerId] - 1
+					if args.PrevLogIndex > 0 {
+						args.PrevLogTerm = rf.log[args.PrevLogIndex - 1].Term
 					}
+					args.Entries = make([]*LogEntry, 0)
+					args.Entries = append(args.Entries, rf.log[rf.nextIndex[peerId]-1:]...)
 				}
 				DPrintf("RaftNode[%d] appendEntries starts,  peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d]",
 					rf.me, peerId, len(rf.log), rf.nextIndex[peerId], rf.matchIndex[peerId], len(args.Entries), rf.commitIndex)
@@ -592,17 +598,27 @@ func (rf *Raft) appendEntriesLoop() {
 						if reply.Success {	// 同步日志成功
 							rf.nextIndex[id] += len(args1.Entries)
 							rf.matchIndex[id] = rf.nextIndex[id] - 1
-							// 更新commitIndex
-							minMatchIndex := math.MaxInt64
+
+							// 数字N, 让peer[i]的大多数>=N
+							// peer[0]' index=2
+							// peer[1]' index=2
+							// peer[2]' index=1
+							// 1,2,2
+							// 更新commitIndex, 就是找中位数
+							sortedMatchIndex := make([]int, 0)
+							sortedMatchIndex = append(sortedMatchIndex, len(rf.log))
 							for i := 0; i < len(rf.peers); i++ {
 								if i == rf.me {
 									continue
 								}
-								if rf.matchIndex[i] < minMatchIndex {
-									minMatchIndex = rf.matchIndex[i]
-								}
+								sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
 							}
-							rf.commitIndex = minMatchIndex
+							sort.Ints(sortedMatchIndex)
+							newCommitIndex := sortedMatchIndex[len(rf.peers) / 2]
+							if newCommitIndex > rf.commitIndex && rf.log[newCommitIndex - 1].Term == rf.currentTerm {
+								rf.commitIndex = newCommitIndex
+							}
+							// rf.commitIndex = minMatchIndex
 						} else {
 							rf.nextIndex[id] -= 1
 							if rf.nextIndex[id] < 1 {
