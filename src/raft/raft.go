@@ -18,6 +18,7 @@ package raft
 //
 
 import (
+	"bytes"
 	"math/rand"
 	"sort"
 	"sync"
@@ -25,10 +26,8 @@ import (
 	"time"
 
 	"../labrpc"
+	"../labgob"
 )
-
-// import "bytes"
-// import "../labgob"
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -113,13 +112,15 @@ func (rf *Raft) GetState() (int, bool) {
 //
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	// 不用加锁，外层逻辑会锁
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	DPrintf("RaftNode[%d] persist starts, currentTerm[%d] voteFor[%d] log[%v]", rf.me, rf.currentTerm, rf.votedFor, rf.log)
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -130,18 +131,13 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	d.Decode(&rf.currentTerm)
+	d.Decode(&rf.votedFor)
+	d.Decode(&rf.log)
 }
 
 //
@@ -275,16 +271,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	// 截断本地日志
+	// 保存日志
 	for i, logEntry := range args.Entries {
 		index := args.PrevLogIndex + i + 1
 		if index > len(rf.log) {
 			rf.log = append(rf.log, logEntry)
 		} else {	// 重叠部分
-			if rf.log[index - 1].Term != logEntry.Term {	// 删除该位置以及后续所有的Log
-				rf.log = rf.log[:index - 1]
-			}
-			rf.log = append(rf.log, logEntry)	// 把新log放进去
+			if rf.log[index - 1].Term != logEntry.Term {
+				rf.log = rf.log[:index - 1]		// 删除当前以及后续所有log
+				rf.log = append(rf.log, logEntry)	// 把新log加入进来
+			}	// term一样啥也不用做，继续向后比对Log
 		}
 	}
 	rf.persist()
@@ -610,7 +606,6 @@ func (rf *Raft) appendEntriesLoop() {
 							if newCommitIndex > rf.commitIndex && rf.log[newCommitIndex - 1].Term == rf.currentTerm {
 								rf.commitIndex = newCommitIndex
 							}
-							// rf.commitIndex = minMatchIndex
 						} else {
 							rf.nextIndex[id] -= 1
 							if rf.nextIndex[id] < 1 {
@@ -670,6 +665,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	DPrintf("RaftNode[%d] Make again", rf.me)
 
 	// election逻辑
 	go rf.electionLoop()
