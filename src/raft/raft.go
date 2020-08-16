@@ -175,6 +175,7 @@ type AppendEntriesReply struct {
 	Term    int
 	Success bool
 	ConflictIndex int
+	ConflictTerm int
 }
 
 //
@@ -238,6 +239,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term = rf.currentTerm
 	reply.Success = false
 	reply.ConflictIndex = -1
+	reply.ConflictTerm = - 1
 
 	defer func() {
 		DPrintf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s] logIndex[%d] prevLogIndex[%d] prevLogTerm[%d] Success[%v] commitIndex[%d] log[%v] ConflictIndex[%d]",
@@ -271,6 +273,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	// 如果本地有前一个日志的话，那么term必须相同，否则false
 	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex - 1].Term != args.PrevLogTerm {
+		reply.ConflictTerm = rf.log[args.PrevLogIndex - 1].Term
+		for index := 1; index <= args.PrevLogIndex; index++ {	// 找到冲突term的首次出现位置，最差就是PrevLogIndex
+			if rf.log[index - 1].Term == reply.ConflictTerm {
+				reply.ConflictIndex = index
+				break
+			}
+		}
 		return
 	}
 
@@ -612,21 +621,26 @@ func (rf *Raft) appendEntriesLoop() {
 								rf.commitIndex = newCommitIndex
 							}
 						} else {
-							/*
-							// 回退1步
-							if reply.ConflictIndex != -1 {	// 因为follower的prevLogIndex没有日志导致的
-								rf.nextIndex[id] = reply.ConflictIndex + 1
-							} else {
-								rf.nextIndex[id] = args1.PrevLogIndex
-								if rf.nextIndex[id] < 1 {
-									rf.nextIndex[id] = 1
+							// 回退优化，参考：https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+							nextIndexBefore := rf.nextIndex[id]	 // 仅为打印log
+
+							if reply.ConflictTerm != -1 { 	// follower的prevLogIndex位置term不同
+								conflictTermIndex := -1
+								for index := args1.PrevLogIndex; index >= 1; index-- {	// 找最后一个conflictTerm
+									if rf.log[index - 1].Term == reply.ConflictTerm {
+										conflictTermIndex = index
+										break
+									}
 								}
+								if conflictTermIndex != -1 {	// leader也存在冲突term的日志，则从term最后一次出现之后的日志开始尝试同步，因为leader/follower可能在该term的日志有部分相同
+									rf.nextIndex[id] = conflictTermIndex + 1
+								} else {	// leader并没有term的日志，那么把follower日志中该term首次出现的位置作为尝试同步的位置，即截断follower在此term的所有日志
+									rf.nextIndex[id] = reply.ConflictIndex
+								}
+							} else { // follower的prevLogIndex位置没有日志
+								rf.nextIndex[id] = reply.ConflictIndex + 1
 							}
-							 */
-							rf.nextIndex[id] = args1.PrevLogIndex
-							if rf.nextIndex[id] < 1 {
-								rf.nextIndex[id] = 1
-							}
+							DPrintf("RaftNode[%d] back-off nextIndex, peer[%d] nextIndexBefore[%d] nextIndex[%d]", rf.me, id, nextIndexBefore, rf.nextIndex[id])
 						}
 					}
 				}(peerId, &args)
