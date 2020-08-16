@@ -583,8 +583,10 @@ func (rf *Raft) appendEntriesLoop() {
 							rf.persist()
 							return
 						}
+						// 因为RPC期间无锁, 可能相关状态被其他RPC修改了
+						// 因此这里得根据发出RPC请求时的状态做更新，而不要直接对nextIndex和matchIndex做相对加减
 						if reply.Success {	// 同步日志成功
-							rf.nextIndex[id] += len(args1.Entries)
+							rf.nextIndex[id] = args1.PrevLogIndex + len(args1.Entries) + 1
 							rf.matchIndex[id] = rf.nextIndex[id] - 1
 
 							// 数字N, 让peer[i]的大多数>=N
@@ -607,7 +609,8 @@ func (rf *Raft) appendEntriesLoop() {
 								rf.commitIndex = newCommitIndex
 							}
 						} else {
-							rf.nextIndex[id] -= 1
+							// 回退1步
+							rf.nextIndex[id] = args1.PrevLogIndex
 							if rf.nextIndex[id] < 1 {
 								rf.nextIndex[id] = 1
 							}
