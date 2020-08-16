@@ -174,6 +174,7 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	ConflictIndex int
 }
 
 //
@@ -236,10 +237,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
+	reply.ConflictIndex = -1
 
 	defer func() {
-		DPrintf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s] logIndex[%d] prevLogIndex[%d] prevLogTerm[%d] Success[%v] commitIndex[%d] log[%v]",
-			rf.me, rf.leaderId, args.Term, rf.currentTerm, rf.role, len(rf.log), args.PrevLogIndex, args.PrevLogTerm, reply.Success, rf.commitIndex, rf.log)
+		DPrintf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s] logIndex[%d] prevLogIndex[%d] prevLogTerm[%d] Success[%v] commitIndex[%d] log[%v] ConflictIndex[%d]",
+			rf.me, rf.leaderId, args.Term, rf.currentTerm, rf.role, len(rf.log), args.PrevLogIndex, args.PrevLogTerm, reply.Success, rf.commitIndex, rf.log, reply.ConflictIndex)
 	}()
 
 	if args.Term < rf.currentTerm {
@@ -264,6 +266,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// appendEntries RPC , receiver 2)
 	// 如果本地没有前一个日志的话，那么false
 	if len(rf.log) < args.PrevLogIndex {
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 	// 如果本地有前一个日志的话，那么term必须相同，否则false
@@ -609,7 +612,17 @@ func (rf *Raft) appendEntriesLoop() {
 								rf.commitIndex = newCommitIndex
 							}
 						} else {
+							/*
 							// 回退1步
+							if reply.ConflictIndex != -1 {	// 因为follower的prevLogIndex没有日志导致的
+								rf.nextIndex[id] = reply.ConflictIndex + 1
+							} else {
+								rf.nextIndex[id] = args1.PrevLogIndex
+								if rf.nextIndex[id] < 1 {
+									rf.nextIndex[id] = 1
+								}
+							}
+							 */
 							rf.nextIndex[id] = args1.PrevLogIndex
 							if rf.nextIndex[id] < 1 {
 								rf.nextIndex[id] = 1
