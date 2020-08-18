@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-const Debug = 1
+const Debug = 0
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -21,7 +21,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 
 const (
 	OP_TYPE_PUT = "Put"
-	OP_TYPE_PUT_APPEND = "PutAppend"
+	OP_TYPE_APPEND = "Append"
 	OP_TYPE_GET = "Get"
 )
 
@@ -231,11 +231,11 @@ func (kv *KVServer) applyLoop() {
 				}
 
 				// 只处理ID单调递增的客户端写请求
-				if op.Type == OP_TYPE_PUT || op.Type == OP_TYPE_PUT_APPEND {
+				if op.Type == OP_TYPE_PUT || op.Type == OP_TYPE_APPEND {
 					if !existSeq || op.SeqId > prevSeq { // 如果是递增的请求ID，那么接受它的变更
 						if op.Type == OP_TYPE_PUT {	// put操作
 							kv.kvStore[op.Key] = op.Value
-						} else if op.Type == OP_TYPE_PUT_APPEND {	// put-append操作
+						} else if op.Type == OP_TYPE_APPEND {	// put-append操作
 							if val, exist := kv.kvStore[op.Key]; exist {
 								kv.kvStore[op.Key] = val + op.Value
 							} else {
@@ -250,6 +250,7 @@ func (kv *KVServer) applyLoop() {
 						opCtx.value, opCtx.keyExist = kv.kvStore[op.Key]
 					}
 				}
+				DPrintf("RaftNode[%d] applyLoop, kvStore[%v]", kv.me, kv.kvStore)
 
 				// 唤醒挂起的RPC
 				if existOp {
@@ -277,7 +278,7 @@ func (kv *KVServer) applyLoop() {
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
-	labgob.Register(Op{})
+	labgob.Register(&Op{})
 
 	kv := new(KVServer)
 	kv.me = me
