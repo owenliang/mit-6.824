@@ -1,11 +1,16 @@
 package kvraft
 
-import "../labrpc"
+import (
+	"../labrpc"
+	"sync"
+	"time"
+)
 import "crypto/rand"
 import "math/big"
 
 
 type Clerk struct {
+	mu sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 }
@@ -54,6 +59,24 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
+	args := PutAppendArgs{
+		Key: key,
+		Value: value,
+		Op: op,
+		ReqId: nrand(),
+	}
+
+	peerId := 0
+	for {
+		reply := PutAppendReply{}
+		if ck.servers[peerId].Call("KVServer.PutAppend", &args, &reply) {
+			if reply.Err == OK {	// 成功
+				break
+			}
+		}
+		peerId = (peerId + 1) % len(ck.servers)
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {
