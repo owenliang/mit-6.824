@@ -3,6 +3,7 @@ package kvraft
 import (
 	"../labrpc"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 import "crypto/rand"
@@ -13,6 +14,10 @@ type Clerk struct {
 	mu sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
+	// 实际工程里应该要考虑seqId如何持久化，不能回退
+	clientId int64	// 客户端唯一标识
+	seqId int64	// 该客户端单调递增的请求id
+	leaderId int
 }
 
 func nrand() int64 {
@@ -26,6 +31,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
+	ck.clientId = nrand()
 	return ck
 }
 
@@ -42,9 +48,28 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-
 	// You will have to modify this function.
-	return ""
+	args := GetArgs{
+		Key: key,
+		ClientId: ck.clientId,
+		SeqId: atomic.AddInt64(&ck.seqId, 1),
+	}
+
+	DPrintf("Client[%d] Get starts, Key=%s ", ck.clientId, key)
+
+	leaderId := ck.currentLeader()
+	for {
+		reply := GetReply{}
+		if ck.servers[leaderId].Call("KVServer.Get", &args, &reply) {
+			if reply.Err == OK {	// 命中
+				return reply.Value
+			} else if reply.Err == ErrNoKey {	// 不存在
+				return "";
+			}
+		}
+		leaderId = ck.changeLeader()
+		time.Sleep(1 * time.Millisecond)
+	}
 }
 
 //
@@ -63,19 +88,22 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		Key: key,
 		Value: value,
 		Op: op,
-		ReqId: nrand(),
+		ClientId: ck.clientId,
+		SeqId: atomic.AddInt64(&ck.seqId, 1),
 	}
 
-	peerId := 0
+	DPrintf("Client[%d] PutAppend, Key=%s Value=%s", ck.clientId, key, value)
+
+	leaderId := ck.currentLeader()
 	for {
 		reply := PutAppendReply{}
-		if ck.servers[peerId].Call("KVServer.PutAppend", &args, &reply) {
+		if ck.servers[leaderId].Call("KVServer.PutAppend", &args, &reply) {
 			if reply.Err == OK {	// 成功
 				break
 			}
 		}
-		peerId = (peerId + 1) % len(ck.servers)
-		time.Sleep(10 * time.Millisecond)
+		leaderId = ck.changeLeader()
+		time.Sleep(1 * time.Millisecond)
 	}
 }
 
@@ -84,4 +112,18 @@ func (ck *Clerk) Put(key string, value string) {
 }
 func (ck *Clerk) Append(key string, value string) {
 	ck.PutAppend(key, value, "Append")
+}
+
+func (ck *Clerk) currentLeader() (leaderId int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	leaderId = ck.leaderId
+	return
+}
+
+func (ck *Clerk) changeLeader() (leaderId int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.leaderId = (ck.leaderId + 1) % len(ck.servers)
+	return ck.leaderId
 }

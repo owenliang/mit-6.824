@@ -44,6 +44,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm int
 }
 
 // 日志项
@@ -662,6 +663,7 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 					CommandValid: true,
 					Command:      rf.log[rf.lastApplied-1].Command,
 					CommandIndex: rf.lastApplied,
+					CommandTerm: rf.log[rf.lastApplied - 1].Term,
 				}
 				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
 			}
