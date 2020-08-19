@@ -14,7 +14,7 @@ type Clerk struct {
 	mu sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	// 实际工程里应该要考虑seqId如何持久化，不能回退
+	// 只需要确保clientId每次重启不重复，那么clientId+seqId就是安全的
 	clientId int64	// 客户端唯一标识
 	seqId int64	// 该客户端单调递增的请求id
 	leaderId int
