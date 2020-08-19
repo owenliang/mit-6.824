@@ -653,21 +653,28 @@ func (rf *Raft) appendEntriesLoop() {
 func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 	for !rf.killed(){
 		time.Sleep(10 * time.Millisecond)
+
+		var appliedMsgs = make([]ApplyMsg, 0)
+
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
-			if rf.commitIndex > rf.lastApplied {
+			for rf.commitIndex > rf.lastApplied {
 				rf.lastApplied += 1
-				applyCh <- ApplyMsg{
+				appliedMsgs = append(appliedMsgs, ApplyMsg{
 					CommandValid: true,
 					Command:      rf.log[rf.lastApplied-1].Command,
 					CommandIndex: rf.lastApplied,
 					CommandTerm: rf.log[rf.lastApplied - 1].Term,
-				}
+				})
 				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
 			}
 		}()
+		// 锁外提交给应用层
+		for _, msg := range appliedMsgs {
+			applyCh <- msg
+		}
 	}
 }
 
