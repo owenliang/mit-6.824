@@ -422,6 +422,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// todo: lab-3B快照逻辑的支持
 func (rf *Raft) electionLoop() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
