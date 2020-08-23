@@ -1,13 +1,15 @@
 package kvraft
 
 import (
-	"../labgob"
-	"../labrpc"
-	"../raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"../labgob"
+	"../labrpc"
+	"../raft"
 )
 
 const Debug = 0
@@ -20,35 +22,35 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 const (
-	OP_TYPE_PUT = "Put"
+	OP_TYPE_PUT    = "Put"
 	OP_TYPE_APPEND = "Append"
-	OP_TYPE_GET = "Get"
+	OP_TYPE_GET    = "Get"
 )
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Index int // 写入raft log时的index
-	Term int // 写入raft log时的term
-	Type string // PutAppend, Get
-	Key string
-	Value string
-	SeqId int64
+	Index    int    // 写入raft log时的index
+	Term     int    // 写入raft log时的term
+	Type     string // PutAppend, Get
+	Key      string
+	Value    string
+	SeqId    int64
 	ClientId int64
 }
 
 // 等待Raft提交期间的Op上下文, 用于唤醒阻塞的RPC
 type OpContext struct {
-	op *Op
+	op        *Op
 	committed chan byte
 
-	wrongLeader bool 	// 因为index位置log的term不一致, 说明leader换过了
-	ignored bool // 因为req id过期, 导致该日志被跳过
+	wrongLeader bool // 因为index位置log的term不一致, 说明leader换过了
+	ignored     bool // 因为req id过期, 导致该日志被跳过
 
 	// Get操作的结果
 	keyExist bool
-	value string
+	value    string
 }
 
 type KVServer struct {
@@ -61,14 +63,16 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	kvStore map[string]string	// kv存储
-	reqMap map[int]*OpContext	// log index -> 请求上下文
-	seqMap map[int64]int64 // 客户端id -> 客户端seq
+	kvStore map[string]string  // kv存储
+	reqMap  map[int]*OpContext // log index -> 请求上下文
+	seqMap  map[int64]int64    // 客户端id -> 客户端seq
+
+	lastIncludedIndex int // 已应用到kvStore的index
 }
 
-func newOpContext(op *Op) (opCtx *OpContext){
+func newOpContext(op *Op) (opCtx *OpContext) {
 	opCtx = &OpContext{
-		op: op,
+		op:        op,
 		committed: make(chan byte),
 	}
 	return
@@ -79,10 +83,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	reply.Err = OK
 
 	op := &Op{
-		Type: OP_TYPE_GET,
-		Key: args.Key,
+		Type:     OP_TYPE_GET,
+		Key:      args.Key,
 		ClientId: args.ClientId,
-		SeqId: args.SeqId,
+		SeqId:    args.SeqId,
 	}
 
 	// 写入raft层
@@ -122,10 +126,10 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 			reply.Err = ErrWrongLeader
 		} else if !opCtx.keyExist { // key不存在
 			reply.Err = ErrNoKey
-		}  else {
-			reply.Value = opCtx.value	// 返回值
+		} else {
+			reply.Value = opCtx.value // 返回值
 		}
-	case <- timer.C:	// 如果2秒都没提交成功，让client重试
+	case <-timer.C: // 如果2秒都没提交成功，让client重试
 		reply.Err = ErrWrongLeader
 	}
 }
@@ -135,11 +139,11 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	reply.Err = OK
 
 	op := &Op{
-		Type: args.Op,
-		Key: args.Key,
-		Value: args.Value,
+		Type:     args.Op,
+		Key:      args.Key,
+		Value:    args.Value,
 		ClientId: args.ClientId,
-		SeqId: args.SeqId,
+		SeqId:    args.SeqId,
 	}
 
 	// 写入raft层
@@ -174,13 +178,13 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	timer := time.NewTimer(2000 * time.Millisecond)
 	defer timer.Stop()
 	select {
-	case <- opCtx.committed:	// 如果提交了
-		if opCtx.wrongLeader {	// 同样index位置的term不一样了, 说明leader变了，需要client向新leader重新写入
+	case <-opCtx.committed: // 如果提交了
+		if opCtx.wrongLeader { // 同样index位置的term不一样了, 说明leader变了，需要client向新leader重新写入
 			reply.Err = ErrWrongLeader
 		} else if opCtx.ignored {
 			// 说明req id过期了，该请求被忽略，对MIT这个lab来说只需要告知客户端OK跳过即可
 		}
-	case <- timer.C:	// 如果2秒都没提交成功，让client重试
+	case <-timer.C: // 如果2秒都没提交成功，让client重试
 		reply.Err = ErrWrongLeader
 	}
 }
@@ -209,13 +213,16 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) applyLoop() {
 	for !kv.killed() {
 		select {
-		case msg := <- kv.applyCh:
+		case msg := <-kv.applyCh:
 			cmd := msg.Command
 			index := msg.CommandIndex
 
 			func() {
 				kv.mu.Lock()
 				defer kv.mu.Unlock()
+
+				// 更新已经应用到的日志
+				kv.lastIncludedIndex = index
 
 				// 操作日志
 				op := cmd.(*Op)
@@ -224,7 +231,7 @@ func (kv *KVServer) applyLoop() {
 				prevSeq, existSeq := kv.seqMap[op.ClientId]
 				kv.seqMap[op.ClientId] = op.SeqId
 
-				if existOp {	// 存在等待结果的RPC, 那么判断状态是否与写入时一致
+				if existOp { // 存在等待结果的RPC, 那么判断状态是否与写入时一致
 					if opCtx.op.Term != op.Term {
 						opCtx.wrongLeader = true
 					}
@@ -233,9 +240,9 @@ func (kv *KVServer) applyLoop() {
 				// 只处理ID单调递增的客户端写请求
 				if op.Type == OP_TYPE_PUT || op.Type == OP_TYPE_APPEND {
 					if !existSeq || op.SeqId > prevSeq { // 如果是递增的请求ID，那么接受它的变更
-						if op.Type == OP_TYPE_PUT {	// put操作
+						if op.Type == OP_TYPE_PUT { // put操作
 							kv.kvStore[op.Key] = op.Value
-						} else if op.Type == OP_TYPE_APPEND {	// put-append操作
+						} else if op.Type == OP_TYPE_APPEND { // put-append操作
 							if val, exist := kv.kvStore[op.Key]; exist {
 								kv.kvStore[op.Key] = val + op.Value
 							} else {
@@ -245,7 +252,7 @@ func (kv *KVServer) applyLoop() {
 					} else if existOp {
 						opCtx.ignored = true
 					}
-				} else {	// OP_TYPE_GET
+				} else { // OP_TYPE_GET
 					if existOp {
 						opCtx.value, opCtx.keyExist = kv.kvStore[op.Key]
 					}
@@ -258,6 +265,30 @@ func (kv *KVServer) applyLoop() {
 				}
 			}()
 		}
+	}
+}
+
+func (kv *KVServer) snapshotLoop() {
+	for !kv.killed() {
+		var snapshot []byte
+		func() {
+			kv.mu.Lock()
+			defer kv.mu.Unlock()
+			// 如果raft log超过了maxraftstate大小，那么对kvStore快照下来
+			if kv.maxraftstate != -1 && kv.rf.ExceedLogSize(kv.maxraftstate) {
+				// 锁内快照，离开锁通知raft处理
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.kvStore)
+				snapshot = w.Bytes()
+			}
+		}()
+		if snapshot != nil {
+			DPrintf("RaftNode[%d] KVServer starting snapshot, lastIncludedIndex[%d]", kv.me, kv.lastIncludedIndex)
+			// 通知raft落地snapshot并截断日志
+			kv.rf.SaveSnapshot(snapshot, kv.lastIncludedIndex)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
@@ -293,8 +324,19 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.kvStore = make(map[string]string)
 	kv.reqMap = make(map[int]*OpContext)
 	kv.seqMap = make(map[int64]int64)
+	kv.lastIncludedIndex = 0
+
+	// 加载snapshot
+	snapshot, lastIncludedIndex := kv.rf.LoadSnapshotUnsafe()
+	if snapshot != nil {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		d.Decode(&kv.kvStore)
+		kv.lastIncludedIndex = lastIncludedIndex
+	}
 
 	go kv.applyLoop()
+	go kv.snapshotLoop()
 
 	return kv
 }
