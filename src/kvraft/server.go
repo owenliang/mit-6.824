@@ -335,6 +335,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		kv.lastIncludedIndex = lastIncludedIndex
 	}
 
+	DPrintf("RaftNode[%d] KVServer starts all Loops, maxraftstate[%d] lastIncludedIndex[%d]", kv.me,  kv.maxraftstate, kv.lastIncludedIndex)
+
 	go kv.applyLoop()
 	go kv.snapshotLoop()
 

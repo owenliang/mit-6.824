@@ -194,6 +194,7 @@ type AppendEntriesReply struct {
 //
 // example RequestVote RPC handler.
 //
+// todo: lab-3B快照逻辑的支持
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
@@ -242,6 +243,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.persist()
 }
 
+// todo: lab-3B快照逻辑的支持
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -541,6 +543,7 @@ func (rf *Raft) electionLoop() {
 }
 
 // lab-2A只做心跳，不考虑log同步
+// todo: lab-3B快照逻辑的支持
 func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
@@ -679,7 +682,7 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 					CommandValid: true,
 					Command:      rf.log[appliedIndex -1].Command,
 					CommandIndex: rf.lastApplied,
-					CommandTerm:  rf.log[appliedIndex - -1].Term,
+					CommandTerm:  rf.log[appliedIndex -1].Term,
 				})
 				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
 			}
@@ -754,12 +757,18 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, lastIncludedIndex int) {
 		return
 	}
 
-	// 要压缩的日志长度
-	compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
+	// 快照的元信息
+	rf.lastIncludedIndex = lastIncludedIndex
+	rf.lastIncludedTerm = rf.log[lastIncludedIndex - rf.lastIncludedIndex - 1].Term
+
 	// 压缩内存日志
+	compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
 	afterLog := make([]LogEntry, len(rf.log) - compactLogLen)
 	copy(afterLog, rf.log[compactLogLen:])
 	rf.log = afterLog
+
+	DPrintf("RafeNode[%d] SaveSnapshot, lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
 
 	// 把snapshot和raftstate持久化
 	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
@@ -772,6 +781,6 @@ func (rf *Raft) LoadSnapshotUnsafe() (snapshot []byte, lastIncludedIndex int) {
 	// snapshot部分是已应用到状态机的
 	rf.lastApplied = rf.lastIncludedIndex
 	DPrintf("RaftNode[%d] LoadSnapshotUnsafe, snapshotSize[%d] lastIncludeIndex[%d]",
-		len(snapshot), lastIncludedIndex)
+		rf.me, len(snapshot), lastIncludedIndex)
 	return
 }
