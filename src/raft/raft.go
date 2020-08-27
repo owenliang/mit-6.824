@@ -41,10 +41,17 @@ import (
 // ApplyMsg, but set CommandValid to false for these other uses.
 //
 type ApplyMsg struct {
-	CommandValid bool
+	CommandValid bool	// true为log，false为snapshot
+
+	// 向application层提交日志
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
+
+	// 向application层安装快照
+	Snapshot []byte
+	LastIncludedIndex int
+	LastIncludedTerm int
 }
 
 // 日志项
@@ -92,6 +99,8 @@ type Raft struct {
 	leaderId          int       // leader的id
 	lastActiveTime    time.Time // 上次活跃时间（刷新时机：收到leader心跳、给其他candidates投票、请求其他节点投票）
 	lastBroadcastTime time.Time // 作为leader，上次的广播时间
+
+	applyCh chan ApplyMsg	// 应用层的提交队列
 }
 
 // return currentTerm and whether this server
@@ -666,7 +675,7 @@ func (rf *Raft) appendEntriesLoop() {
 	}
 }
 
-func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
+func (rf *Raft) applyLogLoop() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
 
@@ -690,7 +699,7 @@ func (rf *Raft) applyLogLoop(applyCh chan ApplyMsg) {
 		}()
 		// 锁外提交给应用层
 		for _, msg := range appliedMsgs {
-			applyCh <- msg
+			rf.applyCh <- msg
 		}
 	}
 }
@@ -720,9 +729,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.lastIncludedIndex = 0
 	rf.lastIncludedTerm = 0
 	rf.lastActiveTime = time.Now()
+	rf.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	// 向application层安装快照
+	rf.installSnapshotToApplication()
 
 	DPrintf("RaftNode[%d] Make again", rf.me)
 
@@ -731,11 +744,35 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// leader逻辑
 	go rf.appendEntriesLoop()
 	// apply逻辑
-	go rf.applyLogLoop(applyCh)
+	go rf.applyLogLoop()
 
 	DPrintf("Raftnode[%d]启动", me)
 
 	return rf
+}
+
+func (rf *Raft) installSnapshotToApplication() {
+	var applyMsg *ApplyMsg
+	func() {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+
+		// 同步给application层的快照
+		applyMsg = &ApplyMsg{
+			CommandValid: false,
+			Snapshot: rf.persister.ReadSnapshot(),
+			LastIncludedIndex: rf.lastIncludedIndex,
+			LastIncludedTerm: rf.lastIncludedTerm,
+		}
+		// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
+		rf.lastApplied = rf.lastIncludedIndex
+
+		DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+			rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
+	}()
+	// 锁外投递channel，否则chan满了可能导致application层消费channel死锁
+	rf.applyCh <- *applyMsg
+	return
 }
 
 // 日志是否需要压缩
@@ -749,7 +786,7 @@ func (rf *Raft) ExceedLogSize(logSize int) bool {
 }
 
 // 保存snapshot，截断log
-func (rf *Raft) SaveSnapshot(snapshot []byte, lastIncludedIndex int) {
+func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -759,6 +796,10 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, lastIncludedIndex int) {
 	}
 
 	// 快照的元信息
+	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
+
+	/*
 	rf.lastIncludedIndex = lastIncludedIndex
 	rf.lastIncludedTerm = rf.log[lastIncludedIndex - rf.lastIncludedIndex - 1].Term
 
@@ -768,20 +809,11 @@ func (rf *Raft) SaveSnapshot(snapshot []byte, lastIncludedIndex int) {
 	copy(afterLog, rf.log[compactLogLen:])
 	rf.log = afterLog
 
-	DPrintf("RafeNode[%d] SaveSnapshot, lastIncludedIndex[%d] lastIncludedTerm[%d]",
-		rf.me, rf.lastIncludedIndex, rf.lastIncludedTerm)
-
 	// 把snapshot和raftstate持久化
 	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
+	 */
+
+	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 }
 
-// 加载snapshot（非线程安全，application层启动时候加载一下）
-func (rf *Raft) LoadSnapshotUnsafe() (snapshot []byte, lastIncludedIndex int) {
-	snapshot = rf.persister.ReadSnapshot()
-	lastIncludedIndex = rf.lastIncludedIndex
-	// snapshot部分是已应用到状态机的
-	rf.lastApplied = rf.lastIncludedIndex
-	DPrintf("RaftNode[%d] LoadSnapshotUnsafe, snapshotSize[%d] lastIncludeIndex[%d]",
-		rf.me, len(snapshot), lastIncludedIndex)
-	return
-}

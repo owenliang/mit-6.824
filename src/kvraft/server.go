@@ -12,7 +12,7 @@ import (
 	"../raft"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -67,7 +67,7 @@ type KVServer struct {
 	reqMap  map[int]*OpContext // log index -> 请求上下文
 	seqMap  map[int64]int64    // 客户端id -> 客户端seq
 
-	lastIncludedIndex int // 已应用到kvStore的index
+	lastAppliedIndex int // 已应用到kvStore的日志index
 }
 
 func newOpContext(op *Op) (opCtx *OpContext) {
@@ -214,56 +214,77 @@ func (kv *KVServer) applyLoop() {
 	for !kv.killed() {
 		select {
 		case msg := <-kv.applyCh:
-			cmd := msg.Command
-			index := msg.CommandIndex
-
-			func() {
-				kv.mu.Lock()
-				defer kv.mu.Unlock()
-
-				// 更新已经应用到的日志
-				kv.lastIncludedIndex = index
-
-				// 操作日志
-				op := cmd.(*Op)
-
-				opCtx, existOp := kv.reqMap[index]
-				prevSeq, existSeq := kv.seqMap[op.ClientId]
-				kv.seqMap[op.ClientId] = op.SeqId
-
-				if existOp { // 存在等待结果的RPC, 那么判断状态是否与写入时一致
-					if opCtx.op.Term != op.Term {
-						opCtx.wrongLeader = true
+			// 如果是安装快照
+			if !msg.CommandValid {
+				func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+					if len(msg.Snapshot) == 0 {	// 空快照，清空数据
+						kv.kvStore = make(map[string]string)
+						kv.seqMap = make(map[int64]int64)
+					} else {
+						// 反序列化快照, 安装到内存
+						r := bytes.NewBuffer(msg.Snapshot)
+						d := labgob.NewDecoder(r)
+						d.Decode(&kv.kvStore)
+						d.Decode(&kv.seqMap)
 					}
-				}
+					// 已应用到哪个索引
+					kv.lastAppliedIndex = msg.LastIncludedIndex
+					DPrintf("KVServer[%d] installSnapshot, kvStore[%v], seqMap[%v] lastAppliedIndex[%v]", kv.me, len(kv.kvStore), len(kv.seqMap), kv.lastAppliedIndex)
+				}()
+			} else { // 如果是普通log
+				cmd := msg.Command
+				index := msg.CommandIndex
 
-				// 只处理ID单调递增的客户端写请求
-				if op.Type == OP_TYPE_PUT || op.Type == OP_TYPE_APPEND {
-					if !existSeq || op.SeqId > prevSeq { // 如果是递增的请求ID，那么接受它的变更
-						if op.Type == OP_TYPE_PUT { // put操作
-							kv.kvStore[op.Key] = op.Value
-						} else if op.Type == OP_TYPE_APPEND { // put-append操作
-							if val, exist := kv.kvStore[op.Key]; exist {
-								kv.kvStore[op.Key] = val + op.Value
-							} else {
-								kv.kvStore[op.Key] = op.Value
-							}
+				func() {
+					kv.mu.Lock()
+					defer kv.mu.Unlock()
+
+					// 更新已经应用到的日志
+					kv.lastAppliedIndex = index
+
+					// 操作日志
+					op := cmd.(*Op)
+
+					opCtx, existOp := kv.reqMap[index]
+					prevSeq, existSeq := kv.seqMap[op.ClientId]
+					kv.seqMap[op.ClientId] = op.SeqId
+
+					if existOp { // 存在等待结果的RPC, 那么判断状态是否与写入时一致
+						if opCtx.op.Term != op.Term {
+							opCtx.wrongLeader = true
 						}
-					} else if existOp {
-						opCtx.ignored = true
 					}
-				} else { // OP_TYPE_GET
-					if existOp {
-						opCtx.value, opCtx.keyExist = kv.kvStore[op.Key]
-					}
-				}
-				DPrintf("RaftNode[%d] applyLoop, kvStore[%v]", kv.me, kv.kvStore)
 
-				// 唤醒挂起的RPC
-				if existOp {
-					close(opCtx.committed)
-				}
-			}()
+					// 只处理ID单调递增的客户端写请求
+					if op.Type == OP_TYPE_PUT || op.Type == OP_TYPE_APPEND {
+						if !existSeq || op.SeqId > prevSeq { // 如果是递增的请求ID，那么接受它的变更
+							if op.Type == OP_TYPE_PUT { // put操作
+								kv.kvStore[op.Key] = op.Value
+							} else if op.Type == OP_TYPE_APPEND { // put-append操作
+								if val, exist := kv.kvStore[op.Key]; exist {
+									kv.kvStore[op.Key] = val + op.Value
+								} else {
+									kv.kvStore[op.Key] = op.Value
+								}
+							}
+						} else if existOp {
+							opCtx.ignored = true
+						}
+					} else { // OP_TYPE_GET
+						if existOp {
+							opCtx.value, opCtx.keyExist = kv.kvStore[op.Key]
+						}
+					}
+					DPrintf("KVServer[%d] applyLoop, kvStore[%v]", kv.me, len(kv.kvStore))
+
+					// 唤醒挂起的RPC
+					if existOp {
+						close(opCtx.committed)
+					}
+				}()
+			}
 		}
 	}
 }
@@ -271,6 +292,8 @@ func (kv *KVServer) applyLoop() {
 func (kv *KVServer) snapshotLoop() {
 	for !kv.killed() {
 		var snapshot []byte
+		var lastIncludedIndex int
+		// 锁内dump snapshot
 		func() {
 			kv.mu.Lock()
 			defer kv.mu.Unlock()
@@ -279,14 +302,19 @@ func (kv *KVServer) snapshotLoop() {
 				// 锁内快照，离开锁通知raft处理
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
-				e.Encode(kv.kvStore)
+				e.Encode(kv.kvStore)	// kv键值对
+				e.Encode(kv.seqMap)	// 当前各客户端最大请求编号，也要随着snapshot走
 				snapshot = w.Bytes()
+				lastIncludedIndex = kv.lastAppliedIndex
+			}
+			if snapshot != nil {
+				DPrintf("KVServer[%d] KVServer dump snapshot, snapshotSize[%d] lastAppliedIndex[%d]", kv.me, len(snapshot), kv.lastAppliedIndex)
 			}
 		}()
+		// 锁外通知raft层截断
 		if snapshot != nil {
-			DPrintf("RaftNode[%d] KVServer starting snapshot, lastIncludedIndex[%d]", kv.me, kv.lastIncludedIndex)
-			// 通知raft落地snapshot并截断日志
-			kv.rf.SaveSnapshot(snapshot, kv.lastIncludedIndex)
+			// 通知raft落地snapshot并截断日志（都是已提交的日志，不会因为主从切换截断，放心操作）
+			kv.rf.TakeSnapshot(snapshot, lastIncludedIndex)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -317,25 +345,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1)	// 至少1个容量，启动后初始化snapshot用
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 	kv.kvStore = make(map[string]string)
 	kv.reqMap = make(map[int]*OpContext)
 	kv.seqMap = make(map[int64]int64)
-	kv.lastIncludedIndex = 0
+	kv.lastAppliedIndex = 0
 
-	// 加载snapshot
-	snapshot, lastIncludedIndex := kv.rf.LoadSnapshotUnsafe()
-	if snapshot != nil {
-		r := bytes.NewBuffer(snapshot)
-		d := labgob.NewDecoder(r)
-		d.Decode(&kv.kvStore)
-		kv.lastIncludedIndex = lastIncludedIndex
-	}
-
-	DPrintf("RaftNode[%d] KVServer starts all Loops, maxraftstate[%d] lastIncludedIndex[%d]", kv.me,  kv.maxraftstate, kv.lastIncludedIndex)
+	DPrintf("KVServer[%d] KVServer starts all Loops, maxraftstate[%d]", kv.me,  kv.maxraftstate)
 
 	go kv.applyLoop()
 	go kv.snapshotLoop()
