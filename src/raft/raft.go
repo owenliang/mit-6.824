@@ -249,27 +249,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.persist()
 }
 
-// 最后的index
-func (rf *Raft) lastIndex() int {
-	return rf.lastIncludedIndex + len(rf.log)
-}
-// 最后的term
-func (rf *Raft) lastTerm() (lastLogTerm int) {
-	lastLogTerm = rf.lastIncludedTerm	// for snapshot
-	if len(rf.log) != 0 {
-		lastLogTerm = rf.log[len(rf.log)-1].Term
-	}
-	return
-}
-
-
-// todo: lab-3B快照逻辑的支持
+// 已兼容snapshot
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	DPrintf("RaftNode[%d] Handle AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s] logIndex[%d] prevLogIndex[%d] prevLogTerm[%d] commitIndex[%d] Entries[%v]",
-		rf.me, rf.leaderId, args.Term, rf.currentTerm, rf.role, len(rf.log), args.PrevLogIndex, args.PrevLogTerm, rf.commitIndex, args.Entries)
+		rf.me, rf.leaderId, args.Term, rf.currentTerm, rf.role, rf.lastIndex(), args.PrevLogIndex, args.PrevLogTerm, rf.commitIndex, args.Entries)
 
 	reply.Term = rf.currentTerm
 	reply.Success = false
@@ -278,7 +264,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	defer func() {
 		DPrintf("RaftNode[%d] Return AppendEntries, LeaderId[%d] Term[%d] CurrentTerm[%d] role=[%s] logIndex[%d] prevLogIndex[%d] prevLogTerm[%d] Success[%v] commitIndex[%d] log[%v] ConflictIndex[%d]",
-			rf.me, rf.leaderId, args.Term, rf.currentTerm, rf.role, len(rf.log), args.PrevLogIndex, args.PrevLogTerm, reply.Success, rf.commitIndex, rf.log, reply.ConflictIndex)
+			rf.me, rf.leaderId, args.Term, rf.currentTerm, rf.role, rf.lastIndex(), args.PrevLogIndex, args.PrevLogTerm, reply.Success, rf.commitIndex, len(rf.log), reply.ConflictIndex)
 	}()
 
 	if args.Term < rf.currentTerm {
@@ -300,32 +286,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 刷新活跃时间
 	rf.lastActiveTime = time.Now()
 
-	// appendEntries RPC , receiver 2)
-	// 如果本地没有前一个日志的话，那么false
-	if len(rf.log) < args.PrevLogIndex {
-		reply.ConflictIndex = len(rf.log)
+	// 如果prevLogIndex在快照内，且不是快照最后一个log，那么只能从index=1开始同步了
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		reply.ConflictIndex = 1
 		return
-	}
-	// 如果本地有前一个日志的话，那么term必须相同，否则false
-	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		reply.ConflictTerm = rf.log[args.PrevLogIndex-1].Term
-		for index := 1; index <= args.PrevLogIndex; index++ { // 找到冲突term的首次出现位置，最差就是PrevLogIndex
-			if rf.log[index-1].Term == reply.ConflictTerm {
-				reply.ConflictIndex = index
-				break
-			}
+	} else if args.PrevLogIndex == rf.lastIncludedIndex {	// prevLogIndex正好等于快照的最后一个log
+		if args.PrevLogTerm != rf.lastIncludedTerm {	// 冲突了，那么从index=1开始同步吧
+			reply.ConflictIndex = 1
+			return
 		}
-		return
+		// 否则继续走后续的日志覆盖逻辑
+	} else {	// prevLogIndex在快照之后，那么进一步判定
+		if len(rf.log) < args.PrevLogIndex - rf.lastIncludedIndex {	// prevLogIndex位置没有日志的case
+			reply.ConflictIndex = rf.lastIncludedIndex + len(rf.log)
+			return
+		}
+		// prevLogIndex位置有日志，那么判断term必须相同，否则false
+		if rf.log[rf.index2LogPos(args.PrevLogIndex)].Term != args.PrevLogTerm {
+			reply.ConflictTerm = rf.log[rf.index2LogPos(args.PrevLogIndex)].Term
+			for index := rf.lastIncludedIndex + 1; index <= args.PrevLogIndex; index++ { // 找到冲突term的首次出现位置，最差就是PrevLogIndex
+				if rf.log[rf.index2LogPos(index)].Term == reply.ConflictTerm {
+					reply.ConflictIndex = index
+					break
+				}
+			}
+			return
+		}
+		// 否则继续走后续的日志覆盖逻辑
 	}
 
 	// 保存日志
 	for i, logEntry := range args.Entries {
-		index := args.PrevLogIndex + i + 1
-		if index > len(rf.log) {
+		index := args.PrevLogIndex + 1 + i
+		logPos := rf.index2LogPos(index)
+		if index > rf.lastIndex() {	// 超出现有日志长度，继续追加
 			rf.log = append(rf.log, logEntry)
 		} else { // 重叠部分
-			if rf.log[index-1].Term != logEntry.Term {
-				rf.log = rf.log[:index-1]         // 删除当前以及后续所有log
+			if rf.log[logPos].Term != logEntry.Term {
+				rf.log = rf.log[:logPos]         // 删除当前以及后续所有log
 				rf.log = append(rf.log, logEntry) // 把新log加入进来
 			} // term一样啥也不用做，继续向后比对Log
 		}
@@ -335,8 +333,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 更新提交下标
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = args.LeaderCommit
-		if len(rf.log) < rf.commitIndex {
-			rf.commitIndex = len(rf.log)
+		if rf.lastIndex() < rf.commitIndex {
+			rf.commitIndex = rf.lastIndex()
 		}
 	}
 	reply.Success = true
@@ -674,7 +672,7 @@ func (rf *Raft) appendEntriesLoop() {
 									rf.nextIndex[id] = reply.ConflictIndex
 								}
 							} else { // follower的prevLogIndex位置没有日志
-								rf.nextIndex[id] = reply.ConflictIndex + 1
+								rf.nextIndex[id] = reply.ConflictIndex
 							}
 							DPrintf("RaftNode[%d] back-off nextIndex, peer[%d] nextIndexBefore[%d] nextIndex[%d]", rf.me, id, nextIndexBefore, rf.nextIndex[id])
 						}
@@ -713,6 +711,89 @@ func (rf *Raft) applyLogLoop() {
 		}
 	}
 }
+
+//////////// snapshot 相关方法 //////////////////
+
+func (rf *Raft) installSnapshotToApplication() {
+	var applyMsg *ApplyMsg
+
+	// 同步给application层的快照
+	applyMsg = &ApplyMsg{
+		CommandValid: false,
+		Snapshot: rf.persister.ReadSnapshot(),
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm: rf.lastIncludedTerm,
+	}
+	// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
+	rf.lastApplied = rf.lastIncludedIndex
+
+	DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
+	rf.applyCh <- *applyMsg
+	return
+}
+
+// 最后的index
+func (rf *Raft) lastIndex() int {
+	return rf.lastIncludedIndex + len(rf.log)
+}
+
+// 最后的term
+func (rf *Raft) lastTerm() (lastLogTerm int) {
+	lastLogTerm = rf.lastIncludedTerm	// for snapshot
+	if len(rf.log) != 0 {
+		lastLogTerm = rf.log[len(rf.log)-1].Term
+	}
+	return
+}
+
+// 日志index转化成log数组下标
+func (rf *Raft) index2LogPos(index int) (pos int) {
+	return index - rf.lastIncludedIndex - 1
+}
+
+// 日志是否需要压缩
+func (rf *Raft) ExceedLogSize(logSize int) bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.persister.RaftStateSize() >= logSize {
+		return true
+	}
+	return false
+}
+
+// 保存snapshot，截断log
+func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 已经有更大index的snapshot了
+	if lastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
+	// 快照的元信息
+	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
+
+	/*
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = rf.log[lastIncludedIndex - rf.lastIncludedIndex - 1].Term
+
+		// 压缩内存日志
+		compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
+		afterLog := make([]LogEntry, len(rf.log) - compactLogLen)
+		copy(afterLog, rf.log[compactLogLen:])
+		rf.log = afterLog
+
+		// 把snapshot和raftstate持久化
+		rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
+	*/
+
+	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
+}
+
 
 //
 // the service or tester wants to create a Raft server. the ports
@@ -759,66 +840,5 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	DPrintf("Raftnode[%d]启动", me)
 
 	return rf
-}
-
-func (rf *Raft) installSnapshotToApplication() {
-	var applyMsg *ApplyMsg
-
-	// 同步给application层的快照
-	applyMsg = &ApplyMsg{
-		CommandValid: false,
-		Snapshot: rf.persister.ReadSnapshot(),
-		LastIncludedIndex: rf.lastIncludedIndex,
-		LastIncludedTerm: rf.lastIncludedTerm,
-	}
-	// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
-	rf.lastApplied = rf.lastIncludedIndex
-
-	DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
-		rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
-	rf.applyCh <- *applyMsg
-	return
-}
-
-// 日志是否需要压缩
-func (rf *Raft) ExceedLogSize(logSize int) bool {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	if rf.persister.RaftStateSize() >= logSize {
-		return true
-	}
-	return false
-}
-
-// 保存snapshot，截断log
-func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
-	// 已经有更大index的snapshot了
-	if lastIncludedIndex <= rf.lastIncludedIndex {
-		return
-	}
-
-	// 快照的元信息
-	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
-		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
-
-	/*
-	rf.lastIncludedIndex = lastIncludedIndex
-	rf.lastIncludedTerm = rf.log[lastIncludedIndex - rf.lastIncludedIndex - 1].Term
-
-	// 压缩内存日志
-	compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
-	afterLog := make([]LogEntry, len(rf.log) - compactLogLen)
-	copy(afterLog, rf.log[compactLogLen:])
-	rf.log = afterLog
-
-	// 把snapshot和raftstate持久化
-	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
-	 */
-
-	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
-		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 }
 
