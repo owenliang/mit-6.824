@@ -297,8 +297,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		// 否则继续走后续的日志覆盖逻辑
 	} else {	// prevLogIndex在快照之后，那么进一步判定
-		if len(rf.log) < args.PrevLogIndex - rf.lastIncludedIndex {	// prevLogIndex位置没有日志的case
-			reply.ConflictIndex = rf.lastIncludedIndex + len(rf.log)
+		if args.PrevLogIndex > rf.lastIndex() {	// prevLogIndex位置没有日志的case
+			reply.ConflictIndex = rf.lastIndex() + 1
 			return
 		}
 		// prevLogIndex位置有日志，那么判断term必须相同，否则false
@@ -560,6 +560,7 @@ func (rf *Raft) electionLoop() {
 	}
 }
 
+// 已兼容snapshot
 func (rf *Raft) doAppendEntries(peerId int) {
 	args := AppendEntriesArgs{}
 	args.Term = rf.currentTerm
@@ -567,26 +568,32 @@ func (rf *Raft) doAppendEntries(peerId int) {
 	args.LeaderCommit = rf.commitIndex
 	args.Entries = make([]LogEntry, 0)
 	args.PrevLogIndex = rf.nextIndex[peerId] - 1
-	if args.PrevLogIndex > 0 {
-		args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+
+	// 如果prevLogIndex是leader快照的最后1条log, 那么取快照的最后1个term
+	if args.PrevLogIndex == rf.lastIncludedIndex {
+		args.PrevLogTerm = rf.lastIncludedTerm
+	} else { // 否则一定是log部分
+		args.PrevLogTerm = rf.log[rf.index2LogPos(args.PrevLogIndex)].Term
 	}
-	args.Entries = append(args.Entries, rf.log[rf.nextIndex[peerId]-1:]...)
+	args.Entries = append(args.Entries, rf.log[rf.index2LogPos(args.PrevLogIndex+1):]...)
 
 	DPrintf("RaftNode[%d] appendEntries starts,  currentTerm[%d] peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d]",
-		rf.me, rf.currentTerm, peerId, len(rf.log), rf.nextIndex[peerId], rf.matchIndex[peerId], len(args.Entries), rf.commitIndex)
-	// log相关字段在lab-2A不处理
-	go func(id int, args1 *AppendEntriesArgs) {
+		rf.me, rf.currentTerm, peerId, rf.lastIndex(), rf.nextIndex[peerId], rf.matchIndex[peerId], len(args.Entries), rf.commitIndex)
+
+	go func() {
 		// DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args1.Term, id)
 		reply := AppendEntriesReply{}
-		if ok := rf.sendAppendEntries(id, args1, &reply); ok {
+		if ok := rf.sendAppendEntries(peerId, &args, &reply); ok {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
+
 			defer func() {
 				DPrintf("RaftNode[%d] appendEntries ends,  currentTerm[%d]  peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d]",
-					rf.me, rf.currentTerm, id, len(rf.log), rf.nextIndex[id], rf.matchIndex[id], rf.commitIndex)
+					rf.me, rf.currentTerm, peerId, rf.lastIndex(), rf.nextIndex[peerId], rf.matchIndex[peerId], rf.commitIndex)
 			}()
+
 			// 如果不是rpc前的leader状态了，那么啥也别做了
-			if rf.currentTerm != args1.Term {
+			if rf.currentTerm != args.Term {
 				return
 			}
 			if reply.Term > rf.currentTerm { // 变成follower
@@ -600,8 +607,8 @@ func (rf *Raft) doAppendEntries(peerId int) {
 			// 因为RPC期间无锁, 可能相关状态被其他RPC修改了
 			// 因此这里得根据发出RPC请求时的状态做更新，而不要直接对nextIndex和matchIndex做相对加减
 			if reply.Success { // 同步日志成功
-				rf.nextIndex[id] = args1.PrevLogIndex + len(args1.Entries) + 1
-				rf.matchIndex[id] = rf.nextIndex[id] - 1
+				rf.nextIndex[peerId] = args.PrevLogIndex + len(args.Entries) + 1
+				rf.matchIndex[peerId] = rf.nextIndex[peerId] - 1
 
 				// 数字N, 让peer[i]的大多数>=N
 				// peer[0]' index=2
@@ -610,7 +617,7 @@ func (rf *Raft) doAppendEntries(peerId int) {
 				// 1,2,2
 				// 更新commitIndex, 就是找中位数
 				sortedMatchIndex := make([]int, 0)
-				sortedMatchIndex = append(sortedMatchIndex, len(rf.log))
+				sortedMatchIndex = append(sortedMatchIndex, rf.lastIndex())
 				for i := 0; i < len(rf.peers); i++ {
 					if i == rf.me {
 						continue
@@ -619,37 +626,41 @@ func (rf *Raft) doAppendEntries(peerId int) {
 				}
 				sort.Ints(sortedMatchIndex)
 				newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
-				if newCommitIndex > rf.commitIndex && rf.log[newCommitIndex-1].Term == rf.currentTerm {
+				// 未提交的部分一定是log形态，所以这里rf.log不会越界
+				if newCommitIndex > rf.commitIndex && rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm {
 					rf.commitIndex = newCommitIndex
 				}
 			} else {
 				// 回退优化，参考：https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
-				nextIndexBefore := rf.nextIndex[id] // 仅为打印log
+				nextIndexBefore := rf.nextIndex[peerId] // 仅为打印log
 
-				if reply.ConflictTerm != -1 { // follower的prevLogIndex位置term不同
+				if reply.ConflictTerm != -1 { // follower的prevLogIndex位置term冲突了
+					// 我们找leader log中conflictTerm最后出现位置，如果找到了就用它作为nextIndex，否则用follower的conflictIndex
 					conflictTermIndex := -1
-					for index := args1.PrevLogIndex; index >= 1; index-- { // 找最后一个conflictTerm
-						if rf.log[index-1].Term == reply.ConflictTerm {
+					for index := args.PrevLogIndex; index > rf.lastIncludedIndex; index-- {
+						if rf.log[rf.index2LogPos(index)].Term == reply.ConflictTerm {
 							conflictTermIndex = index
 							break
 						}
 					}
-					if conflictTermIndex != -1 { // leader也存在冲突term的日志，则从term最后一次出现之后的日志开始尝试同步，因为leader/follower可能在该term的日志有部分相同
-						rf.nextIndex[id] = conflictTermIndex + 1
-					} else { // leader并没有term的日志，那么把follower日志中该term首次出现的位置作为尝试同步的位置，即截断follower在此term的所有日志
-						rf.nextIndex[id] = reply.ConflictIndex
+					if conflictTermIndex != -1 { // leader log出现了这个term，那么从这里prevLogIndex之前的最晚出现位置尝试同步
+						rf.nextIndex[peerId] = conflictTermIndex
+					} else {
+						rf.nextIndex[peerId] = reply.ConflictIndex // 用follower首次出现term的index作为同步开始
 					}
-				} else { // follower的prevLogIndex位置没有日志
-					rf.nextIndex[id] = reply.ConflictIndex
+				} else {
+					// follower没有发现prevLogIndex term冲突, 可能是被snapshot了或者日志长度不够
+					// 这时候我们将返回的conflictIndex设置为nextIndex即可
+					rf.nextIndex[peerId] = reply.ConflictIndex
 				}
-				DPrintf("RaftNode[%d] back-off nextIndex, peer[%d] nextIndexBefore[%d] nextIndex[%d]", rf.me, id, nextIndexBefore, rf.nextIndex[id])
+				DPrintf("RaftNode[%d] back-off nextIndex, peer[%d] nextIndexBefore[%d] nextIndex[%d]", rf.me, peerId, nextIndexBefore, rf.nextIndex[peerId])
 			}
 		}
-	}(peerId, &args)
+	}()
 }
 
 func (rf *Raft) doInstallSnapshot(peerId int) {
-
+	DPrintf("RaftNode[%d] doInstallSnapshot, leaderId[%d] peerId[%d]\n", rf.me, rf.leaderId, peerId)
 }
 
 // lab-2A只做心跳，不考虑log同步
@@ -780,23 +791,24 @@ func (rf *Raft) TakeSnapshot(snapshot []byte, lastIncludedIndex int) {
 		return
 	}
 
-	// 快照的元信息
+	// 快照的当前元信息
 	DPrintf("RafeNode[%d] TakeSnapshot begins, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
 		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
 
-	/*
-		rf.lastIncludedIndex = lastIncludedIndex
-		rf.lastIncludedTerm = rf.log[lastIncludedIndex - rf.lastIncludedIndex - 1].Term
+	// 要压缩的日志长度
+	compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
 
-		// 压缩内存日志
-		compactLogLen := lastIncludedIndex - rf.lastIncludedIndex
-		afterLog := make([]LogEntry, len(rf.log) - compactLogLen)
-		copy(afterLog, rf.log[compactLogLen:])
-		rf.log = afterLog
+	// 更新快照元信息
+	rf.lastIncludedTerm = rf.log[rf.index2LogPos(lastIncludedIndex)].Term
+	rf.lastIncludedIndex = lastIncludedIndex
 
-		// 把snapshot和raftstate持久化
-		rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
-	*/
+	// 压缩日志
+	afterLog := make([]LogEntry, len(rf.log) - compactLogLen)
+	copy(afterLog, rf.log[compactLogLen:])
+	rf.log = afterLog
+
+	// 把snapshot和raftstate持久化
+	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), snapshot)
 
 	DPrintf("RafeNode[%d] TakeSnapshot ends, IsLeader[%v] snapshotLastIndex[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
 		rf.me, rf.leaderId==rf.me, lastIncludedIndex, rf.lastIncludedIndex, rf.lastIncludedTerm)
