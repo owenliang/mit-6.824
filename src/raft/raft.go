@@ -203,7 +203,7 @@ type AppendEntriesReply struct {
 //
 // example RequestVote RPC handler.
 //
-// todo: lab-3B快照逻辑的支持
+// 已经兼容snapshot
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
@@ -238,12 +238,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// candidate的日志必须比我的新
 		// 1, 最后一条log，任期大的更新
 		// 2，任期相同, 更长的log则更新
-		lastLogTerm := 0
-		if len(rf.log) != 0 {
-			lastLogTerm = rf.log[len(rf.log)-1].Term
-		}
+		lastLogTerm := rf.lastTerm()
 		// 这里坑了好久，一定要严格遵守论文的逻辑，另外log长度一样也是可以给对方投票的
-		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= len(rf.log)) {
+		if args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= rf.lastIndex()) {
 			rf.votedFor = args.CandidateId
 			reply.VoteGranted = true
 			rf.lastActiveTime = time.Now() // 为其他人投票，那么重置自己的下次投票时间
@@ -251,6 +248,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	rf.persist()
 }
+
+// 最后的index
+func (rf *Raft) lastIndex() int {
+	return rf.lastIncludedIndex + len(rf.log)
+}
+// 最后的term
+func (rf *Raft) lastTerm() (lastLogTerm int) {
+	lastLogTerm = rf.lastIncludedTerm	// for snapshot
+	if len(rf.log) != 0 {
+		lastLogTerm = rf.log[len(rf.log)-1].Term
+	}
+	return
+}
+
 
 // todo: lab-3B快照逻辑的支持
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -384,6 +395,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // term. the third return value is true if this server believes it is
 // the leader.
 //
+// 已兼容snapshot
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -402,7 +414,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Term:    rf.currentTerm,
 	}
 	rf.log = append(rf.log, logEntry)
-	index = len(rf.log)
+	index = rf.lastIndex()
 	term = rf.currentTerm
 	rf.persist()
 
@@ -431,7 +443,7 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-// todo: lab-3B快照逻辑的支持
+// 已经兼容snapshot
 func (rf *Raft) electionLoop() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
@@ -462,11 +474,9 @@ func (rf *Raft) electionLoop() {
 				args := RequestVoteArgs{
 					Term:         rf.currentTerm,
 					CandidateId:  rf.me,
-					LastLogIndex: len(rf.log),
+					LastLogIndex: rf.lastIndex(),
 				}
-				if len(rf.log) != 0 {
-					args.LastLogTerm = rf.log[len(rf.log)-1].Term
-				}
+				args.LastLogTerm = rf.lastTerm()
 
 				rf.mu.Unlock()
 
@@ -538,7 +548,7 @@ func (rf *Raft) electionLoop() {
 					rf.leaderId = rf.me
 					rf.nextIndex = make([]int, len(rf.peers))
 					for i := 0; i < len(rf.peers); i++ {
-						rf.nextIndex[i] = len(rf.log) + 1
+						rf.nextIndex[i] = rf.lastIndex() + 1
 					}
 					rf.matchIndex = make([]int, len(rf.peers))
 					for i := 0; i < len(rf.peers); i++ {
@@ -753,24 +763,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 func (rf *Raft) installSnapshotToApplication() {
 	var applyMsg *ApplyMsg
-	func() {
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
 
-		// 同步给application层的快照
-		applyMsg = &ApplyMsg{
-			CommandValid: false,
-			Snapshot: rf.persister.ReadSnapshot(),
-			LastIncludedIndex: rf.lastIncludedIndex,
-			LastIncludedTerm: rf.lastIncludedTerm,
-		}
-		// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
-		rf.lastApplied = rf.lastIncludedIndex
+	// 同步给application层的快照
+	applyMsg = &ApplyMsg{
+		CommandValid: false,
+		Snapshot: rf.persister.ReadSnapshot(),
+		LastIncludedIndex: rf.lastIncludedIndex,
+		LastIncludedTerm: rf.lastIncludedTerm,
+	}
+	// 快照部分就已经提交给application了，所以后续applyLoop提交日志后移
+	rf.lastApplied = rf.lastIncludedIndex
 
-		DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
-			rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
-	}()
-	// 锁外投递channel，否则chan满了可能导致application层消费channel死锁
+	DPrintf("RaftNode[%d] installSnapshotToApplication, snapshotSize[%d] lastIncludedIndex[%d] lastIncludedTerm[%d]",
+		rf.me,  len(applyMsg.Snapshot), applyMsg.LastIncludedIndex, applyMsg.LastIncludedTerm)
 	rf.applyCh <- *applyMsg
 	return
 }
