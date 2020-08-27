@@ -560,6 +560,98 @@ func (rf *Raft) electionLoop() {
 	}
 }
 
+func (rf *Raft) doAppendEntries(peerId int) {
+	args := AppendEntriesArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	args.LeaderCommit = rf.commitIndex
+	args.Entries = make([]LogEntry, 0)
+	args.PrevLogIndex = rf.nextIndex[peerId] - 1
+	if args.PrevLogIndex > 0 {
+		args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+	}
+	args.Entries = append(args.Entries, rf.log[rf.nextIndex[peerId]-1:]...)
+
+	DPrintf("RaftNode[%d] appendEntries starts,  currentTerm[%d] peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d]",
+		rf.me, rf.currentTerm, peerId, len(rf.log), rf.nextIndex[peerId], rf.matchIndex[peerId], len(args.Entries), rf.commitIndex)
+	// log相关字段在lab-2A不处理
+	go func(id int, args1 *AppendEntriesArgs) {
+		// DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args1.Term, id)
+		reply := AppendEntriesReply{}
+		if ok := rf.sendAppendEntries(id, args1, &reply); ok {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			defer func() {
+				DPrintf("RaftNode[%d] appendEntries ends,  currentTerm[%d]  peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d]",
+					rf.me, rf.currentTerm, id, len(rf.log), rf.nextIndex[id], rf.matchIndex[id], rf.commitIndex)
+			}()
+			// 如果不是rpc前的leader状态了，那么啥也别做了
+			if rf.currentTerm != args1.Term {
+				return
+			}
+			if reply.Term > rf.currentTerm { // 变成follower
+				rf.role = ROLE_FOLLOWER
+				rf.leaderId = -1
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.persist()
+				return
+			}
+			// 因为RPC期间无锁, 可能相关状态被其他RPC修改了
+			// 因此这里得根据发出RPC请求时的状态做更新，而不要直接对nextIndex和matchIndex做相对加减
+			if reply.Success { // 同步日志成功
+				rf.nextIndex[id] = args1.PrevLogIndex + len(args1.Entries) + 1
+				rf.matchIndex[id] = rf.nextIndex[id] - 1
+
+				// 数字N, 让peer[i]的大多数>=N
+				// peer[0]' index=2
+				// peer[1]' index=2
+				// peer[2]' index=1
+				// 1,2,2
+				// 更新commitIndex, 就是找中位数
+				sortedMatchIndex := make([]int, 0)
+				sortedMatchIndex = append(sortedMatchIndex, len(rf.log))
+				for i := 0; i < len(rf.peers); i++ {
+					if i == rf.me {
+						continue
+					}
+					sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
+				}
+				sort.Ints(sortedMatchIndex)
+				newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
+				if newCommitIndex > rf.commitIndex && rf.log[newCommitIndex-1].Term == rf.currentTerm {
+					rf.commitIndex = newCommitIndex
+				}
+			} else {
+				// 回退优化，参考：https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
+				nextIndexBefore := rf.nextIndex[id] // 仅为打印log
+
+				if reply.ConflictTerm != -1 { // follower的prevLogIndex位置term不同
+					conflictTermIndex := -1
+					for index := args1.PrevLogIndex; index >= 1; index-- { // 找最后一个conflictTerm
+						if rf.log[index-1].Term == reply.ConflictTerm {
+							conflictTermIndex = index
+							break
+						}
+					}
+					if conflictTermIndex != -1 { // leader也存在冲突term的日志，则从term最后一次出现之后的日志开始尝试同步，因为leader/follower可能在该term的日志有部分相同
+						rf.nextIndex[id] = conflictTermIndex + 1
+					} else { // leader并没有term的日志，那么把follower日志中该term首次出现的位置作为尝试同步的位置，即截断follower在此term的所有日志
+						rf.nextIndex[id] = reply.ConflictIndex
+					}
+				} else { // follower的prevLogIndex位置没有日志
+					rf.nextIndex[id] = reply.ConflictIndex
+				}
+				DPrintf("RaftNode[%d] back-off nextIndex, peer[%d] nextIndexBefore[%d] nextIndex[%d]", rf.me, id, nextIndexBefore, rf.nextIndex[id])
+			}
+		}
+	}(peerId, &args)
+}
+
+func (rf *Raft) doInstallSnapshot(peerId int) {
+
+}
+
 // lab-2A只做心跳，不考虑log同步
 // todo: lab-3B快照逻辑的支持
 func (rf *Raft) appendEntriesLoop() {
@@ -582,102 +674,18 @@ func (rf *Raft) appendEntriesLoop() {
 			}
 			rf.lastBroadcastTime = time.Now()
 
-			// 并发RPC心跳
-			type AppendResult struct {
-				peerId int
-				resp   *AppendEntriesReply
-			}
-
+			// 向所有follower发送心跳
 			for peerId := 0; peerId < len(rf.peers); peerId++ {
 				if peerId == rf.me {
 					continue
 				}
 
-				args := AppendEntriesArgs{}
-				args.Term = rf.currentTerm
-				args.LeaderId = rf.me
-				args.LeaderCommit = rf.commitIndex
-				args.Entries = make([]LogEntry, 0)
-				args.PrevLogIndex = rf.nextIndex[peerId] - 1
-				if args.PrevLogIndex > 0 {
-					args.PrevLogTerm = rf.log[args.PrevLogIndex-1].Term
+				// 如果nextIndex在leader的snapshot内，那么直接同步snapshot
+				if rf.nextIndex[peerId] <= rf.lastIncludedIndex {
+					rf.doInstallSnapshot(peerId)
+				} else {	// 否则同步日志
+					rf.doAppendEntries(peerId)
 				}
-				args.Entries = append(args.Entries, rf.log[rf.nextIndex[peerId]-1:]...)
-
-				DPrintf("RaftNode[%d] appendEntries starts,  currentTerm[%d] peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] args.Entries[%d] commitIndex[%d]",
-					rf.me, rf.currentTerm, peerId, len(rf.log), rf.nextIndex[peerId], rf.matchIndex[peerId], len(args.Entries), rf.commitIndex)
-				// log相关字段在lab-2A不处理
-				go func(id int, args1 *AppendEntriesArgs) {
-					// DPrintf("RaftNode[%d] appendEntries starts, myTerm[%d] peerId[%d]", rf.me, args1.Term, id)
-					reply := AppendEntriesReply{}
-					if ok := rf.sendAppendEntries(id, args1, &reply); ok {
-						rf.mu.Lock()
-						defer rf.mu.Unlock()
-						defer func() {
-							DPrintf("RaftNode[%d] appendEntries ends,  currentTerm[%d]  peer[%d] logIndex=[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d]",
-								rf.me, rf.currentTerm, id, len(rf.log), rf.nextIndex[id], rf.matchIndex[id], rf.commitIndex)
-						}()
-						// 如果不是rpc前的leader状态了，那么啥也别做了
-						if rf.currentTerm != args1.Term {
-							return
-						}
-						if reply.Term > rf.currentTerm { // 变成follower
-							rf.role = ROLE_FOLLOWER
-							rf.leaderId = -1
-							rf.currentTerm = reply.Term
-							rf.votedFor = -1
-							rf.persist()
-							return
-						}
-						// 因为RPC期间无锁, 可能相关状态被其他RPC修改了
-						// 因此这里得根据发出RPC请求时的状态做更新，而不要直接对nextIndex和matchIndex做相对加减
-						if reply.Success { // 同步日志成功
-							rf.nextIndex[id] = args1.PrevLogIndex + len(args1.Entries) + 1
-							rf.matchIndex[id] = rf.nextIndex[id] - 1
-
-							// 数字N, 让peer[i]的大多数>=N
-							// peer[0]' index=2
-							// peer[1]' index=2
-							// peer[2]' index=1
-							// 1,2,2
-							// 更新commitIndex, 就是找中位数
-							sortedMatchIndex := make([]int, 0)
-							sortedMatchIndex = append(sortedMatchIndex, len(rf.log))
-							for i := 0; i < len(rf.peers); i++ {
-								if i == rf.me {
-									continue
-								}
-								sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
-							}
-							sort.Ints(sortedMatchIndex)
-							newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
-							if newCommitIndex > rf.commitIndex && rf.log[newCommitIndex-1].Term == rf.currentTerm {
-								rf.commitIndex = newCommitIndex
-							}
-						} else {
-							// 回退优化，参考：https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
-							nextIndexBefore := rf.nextIndex[id] // 仅为打印log
-
-							if reply.ConflictTerm != -1 { // follower的prevLogIndex位置term不同
-								conflictTermIndex := -1
-								for index := args1.PrevLogIndex; index >= 1; index-- { // 找最后一个conflictTerm
-									if rf.log[index-1].Term == reply.ConflictTerm {
-										conflictTermIndex = index
-										break
-									}
-								}
-								if conflictTermIndex != -1 { // leader也存在冲突term的日志，则从term最后一次出现之后的日志开始尝试同步，因为leader/follower可能在该term的日志有部分相同
-									rf.nextIndex[id] = conflictTermIndex + 1
-								} else { // leader并没有term的日志，那么把follower日志中该term首次出现的位置作为尝试同步的位置，即截断follower在此term的所有日志
-									rf.nextIndex[id] = reply.ConflictIndex
-								}
-							} else { // follower的prevLogIndex位置没有日志
-								rf.nextIndex[id] = reply.ConflictIndex
-							}
-							DPrintf("RaftNode[%d] back-off nextIndex, peer[%d] nextIndexBefore[%d] nextIndex[%d]", rf.me, id, nextIndexBefore, rf.nextIndex[id])
-						}
-					}
-				}(peerId, &args)
 			}
 		}()
 	}
