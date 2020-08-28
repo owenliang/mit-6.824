@@ -778,7 +778,6 @@ func (rf *Raft) doInstallSnapshot(peerId int) {
 }
 
 // lab-2A只做心跳，不考虑log同步
-// todo: lab-3B快照逻辑的支持
 func (rf *Raft) appendEntriesLoop() {
 	for !rf.killed() {
 		time.Sleep(10 * time.Millisecond)
