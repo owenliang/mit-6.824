@@ -827,12 +827,12 @@ func (rf *Raft) applyLogLoop() {
 
 			for rf.commitIndex > rf.lastApplied {
 				rf.lastApplied += 1
-				appliedIndex := rf.lastApplied - rf.lastIncludedIndex
+				appliedIndex := rf.index2LogPos(rf.lastApplied)
 				appliedMsgs = append(appliedMsgs, ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[appliedIndex -1].Command,
+					Command:      rf.log[appliedIndex].Command,
 					CommandIndex: rf.lastApplied,
-					CommandTerm:  rf.log[appliedIndex -1].Term,
+					CommandTerm:  rf.log[appliedIndex].Term,
 				})
 				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
 			}
