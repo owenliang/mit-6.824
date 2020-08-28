@@ -200,6 +200,20 @@ type AppendEntriesReply struct {
 	ConflictTerm  int
 }
 
+type InstallSnapshotArgs struct {
+	Term int
+	LeaderId int
+	LastIncludedIndex int
+	LastIncludedTerm int
+	Offset int
+	Data []byte
+	Done bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 //
 // example RequestVote RPC handler.
 //
@@ -276,7 +290,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.role = ROLE_FOLLOWER
 		rf.votedFor = -1
-		rf.leaderId = -1
 		rf.persist()
 		// 继续向下走
 	}
@@ -340,6 +353,56 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
+// 安装快照RPC Handler
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	// 发现更大的任期，则转为该任期的follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.role = ROLE_FOLLOWER
+		rf.votedFor = -1
+		rf.persist()
+		// 继续向下走
+	}
+
+	// 认识新的leader
+	rf.leaderId = args.LeaderId
+	// 刷新活跃时间
+	rf.lastActiveTime = time.Now()
+
+	// leader快照不如本地长，那么忽略这个快照
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	} else  {	// leader快照比本地快照长
+		if args.LastIncludedIndex < rf.lastIndex() {	// 快照外还有日志，判断是否需要截断
+			if rf.log[rf.index2LogPos(args.LastIncludedIndex)].Term != args.LastIncludedTerm {
+				rf.log = make([]LogEntry, 0)	// term冲突，扔掉快照外的所有日志
+			} else {	// term没冲突，保留后续日志
+				leftLog := make([]LogEntry, rf.lastIndex() - args.LastIncludedIndex)
+				copy(leftLog, rf.log[rf.index2LogPos(args.LastIncludedIndex)+1:])
+				rf.log = leftLog
+			}
+		} else {
+			rf.log = make([]LogEntry, 0)	// 快照比本地日志长，日志就清空了
+		}
+	}
+	// 更新快照位置
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	// 持久化raft state和snapshot
+	rf.persister.SaveStateAndSnapshot(rf.raftStateForPersist(), args.Data)
+	// snapshot提交给应用层
+	rf.installSnapshotToApplication()
+}
+
 //
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
@@ -376,6 +439,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -561,6 +629,31 @@ func (rf *Raft) electionLoop() {
 }
 
 // 已兼容snapshot
+func (rf *Raft) updateCommitIndex() {
+	// 数字N, 让nextIndex[i]的大多数>=N
+	// peer[0]' index=2
+	// peer[1]' index=2
+	// peer[2]' index=1
+	// 1,2,2
+	// 更新commitIndex, 就是找中位数
+	sortedMatchIndex := make([]int, 0)
+	sortedMatchIndex = append(sortedMatchIndex, rf.lastIndex())
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
+	}
+	sort.Ints(sortedMatchIndex)
+	newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
+	// 如果index属于snapshot范围，那么不要检查term了，因为snapshot的一定是集群提交的
+	// 否则还是检查log的term是否满足条件
+	if newCommitIndex > rf.commitIndex && (newCommitIndex <= rf.lastIncludedIndex || rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm) {
+		rf.commitIndex = newCommitIndex
+	}
+}
+
+// 已兼容snapshot
 func (rf *Raft) doAppendEntries(peerId int) {
 	args := AppendEntriesArgs{}
 	args.Term = rf.currentTerm
@@ -609,27 +702,7 @@ func (rf *Raft) doAppendEntries(peerId int) {
 			if reply.Success { // 同步日志成功
 				rf.nextIndex[peerId] = args.PrevLogIndex + len(args.Entries) + 1
 				rf.matchIndex[peerId] = rf.nextIndex[peerId] - 1
-
-				// 数字N, 让peer[i]的大多数>=N
-				// peer[0]' index=2
-				// peer[1]' index=2
-				// peer[2]' index=1
-				// 1,2,2
-				// 更新commitIndex, 就是找中位数
-				sortedMatchIndex := make([]int, 0)
-				sortedMatchIndex = append(sortedMatchIndex, rf.lastIndex())
-				for i := 0; i < len(rf.peers); i++ {
-					if i == rf.me {
-						continue
-					}
-					sortedMatchIndex = append(sortedMatchIndex, rf.matchIndex[i])
-				}
-				sort.Ints(sortedMatchIndex)
-				newCommitIndex := sortedMatchIndex[len(rf.peers)/2]
-				// 未提交的部分一定是log形态，所以这里rf.log不会越界
-				if newCommitIndex > rf.commitIndex && rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm {
-					rf.commitIndex = newCommitIndex
-				}
+				rf.updateCommitIndex()	// 更新commitIndex
 			} else {
 				// 回退优化，参考：https://thesquareplanet.com/blog/students-guide-to-raft/#an-aside-on-optimizations
 				nextIndexBefore := rf.nextIndex[peerId] // 仅为打印log
@@ -660,7 +733,43 @@ func (rf *Raft) doAppendEntries(peerId int) {
 }
 
 func (rf *Raft) doInstallSnapshot(peerId int) {
-	DPrintf("RaftNode[%d] doInstallSnapshot, leaderId[%d] peerId[%d]\n", rf.me, rf.leaderId, peerId)
+	DPrintf("RaftNode[%d] doInstallSnapshot starts, leaderId[%d] peerId[%d]\n", rf.me, rf.leaderId, peerId)
+
+	args := InstallSnapshotArgs{}
+	args.Term = rf.currentTerm
+	args.LeaderId = rf.me
+	args.LastIncludedIndex = rf.lastIncludedIndex
+	args.LastIncludedTerm = rf.lastIncludedTerm
+	args.Offset = 0
+	args.Data = rf.persister.ReadSnapshot()
+	args.Done = true
+
+	reply := InstallSnapshotReply{}
+
+	go func() {
+		if rf.sendInstallSnapshot(peerId, &args, &reply) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// 如果不是rpc前的leader状态了，那么啥也别做了
+			if rf.currentTerm != args.Term {
+				return
+			}
+			if reply.Term > rf.currentTerm { // 变成follower
+				rf.role = ROLE_FOLLOWER
+				rf.leaderId = -1
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.persist()
+				return
+			}
+			rf.nextIndex[peerId] = rf.lastIndex() + 1	// 重新从末尾同步log（未经优化，但够用）
+			rf.matchIndex[peerId] = args.LastIncludedIndex	// 已同步到的位置（未经优化，但够用）
+			rf.updateCommitIndex()	// 更新commitIndex
+			DPrintf("RaftNode[%d] doInstallSnapshot ends, leaderId[%d] peerId[%d] nextIndex[%d] matchIndex[%d] commitIndex[%d]\n", rf.me, rf.leaderId, peerId, rf.nextIndex[peerId],
+				rf.matchIndex[peerId], rf.commitIndex)
+		}
+	}()
 }
 
 // lab-2A只做心跳，不考虑log同步
