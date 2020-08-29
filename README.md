@@ -1,6 +1,6 @@
 # go-raft
 
-基于Raft的分布式KV存储
+MIT6.824 基于Raft的分布式KV存储
 
 Raft算法：https://github.com/owenliang/go-raft/blob/master/src/raft/raft.go
 
