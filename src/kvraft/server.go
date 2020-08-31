@@ -295,23 +295,21 @@ func (kv *KVServer) snapshotLoop() {
 		var lastIncludedIndex int
 		// 锁内dump snapshot
 		func() {
-			kv.mu.Lock()
-			defer kv.mu.Unlock()
 			// 如果raft log超过了maxraftstate大小，那么对kvStore快照下来
-			if kv.maxraftstate != -1 && kv.rf.ExceedLogSize(kv.maxraftstate) {
+			if kv.maxraftstate != -1 && kv.rf.ExceedLogSize(kv.maxraftstate) {	// 这里调用ExceedLogSize不要加kv锁，否则会死锁
 				// 锁内快照，离开锁通知raft处理
+				kv.mu.Lock()
 				w := new(bytes.Buffer)
 				e := labgob.NewEncoder(w)
 				e.Encode(kv.kvStore)	// kv键值对
 				e.Encode(kv.seqMap)	// 当前各客户端最大请求编号，也要随着snapshot走
 				snapshot = w.Bytes()
 				lastIncludedIndex = kv.lastAppliedIndex
-			}
-			if snapshot != nil {
 				DPrintf("KVServer[%d] KVServer dump snapshot, snapshotSize[%d] lastAppliedIndex[%d]", kv.me, len(snapshot), kv.lastAppliedIndex)
+				kv.mu.Unlock()
 			}
 		}()
-		// 锁外通知raft层截断
+		// 锁外通知raft层截断，否则有死锁
 		if snapshot != nil {
 			// 通知raft落地snapshot并截断日志（都是已提交的日志，不会因为主从切换截断，放心操作）
 			kv.rf.TakeSnapshot(snapshot, lastIncludedIndex)

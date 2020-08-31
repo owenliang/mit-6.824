@@ -219,7 +219,6 @@ type InstallSnapshotReply struct {
 //
 // 已经兼容snapshot
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
-	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -656,6 +655,7 @@ func (rf *Raft) updateCommitIndex() {
 	if newCommitIndex > rf.commitIndex && (newCommitIndex <= rf.lastIncludedIndex || rf.log[rf.index2LogPos(newCommitIndex)].Term == rf.currentTerm) {
 		rf.commitIndex = newCommitIndex
 	}
+	DPrintf("RaftNode[%d] updateCommitIndex, commitIndex[%d] matchIndex[%v]", rf.me, rf.commitIndex, sortedMatchIndex)
 }
 
 // 已兼容snapshot
@@ -816,31 +816,30 @@ func (rf *Raft) appendEntriesLoop() {
 }
 
 func (rf *Raft) applyLogLoop() {
+	noMore := false
 	for !rf.killed() {
-		time.Sleep(10 * time.Millisecond)
-
-		var appliedMsgs = make([]ApplyMsg, 0)
-
+		if noMore {
+			time.Sleep(10 * time.Millisecond)
+		}
 		func() {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 
-			for rf.commitIndex > rf.lastApplied {
+			noMore = true
+			if rf.commitIndex > rf.lastApplied {
 				rf.lastApplied += 1
 				appliedIndex := rf.index2LogPos(rf.lastApplied)
-				appliedMsgs = append(appliedMsgs, ApplyMsg{
+				appliedMsg := ApplyMsg{
 					CommandValid: true,
 					Command:      rf.log[appliedIndex].Command,
 					CommandIndex: rf.lastApplied,
 					CommandTerm:  rf.log[appliedIndex].Term,
-				})
+				}
+				rf.applyCh <- appliedMsg	// 引入snapshot后，这里必须在锁内投递了，否则会和snapshot的交错产生bug
 				DPrintf("RaftNode[%d] applyLog, currentTerm[%d] lastApplied[%d] commitIndex[%d]", rf.me, rf.currentTerm, rf.lastApplied, rf.commitIndex)
+				noMore = false
 			}
 		}()
-		// 锁外提交给应用层
-		for _, msg := range appliedMsgs {
-			rf.applyCh <- msg
-		}
 	}
 }
 
